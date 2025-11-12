@@ -594,6 +594,11 @@ app.post("/channels/create", async (req, res) => {
     if (!payload.pubKey || !payload.channelName) {
        return res.status(400).json({ error: "Payload missing pubKey or channelName." });
     }
+    
+    console.log("--- SERVER IS VERIFYING ---");
+    console.log("SERVER PAYLOAD STRING:", dataToVerify);
+    console.log("SERVER SIGNATURE (first 30):", signature.slice(0, 30) + "...");
+    console.log("SERVER PUBKEY (first 30):", payload.pubKey.slice(0, 30) + "...");
 
     // 5. Verify the signature against the *original string*
     const isOwner = await verifySignature(payload.pubKey, signature, dataToVerify);
