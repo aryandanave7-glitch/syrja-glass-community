@@ -552,9 +552,9 @@ app.delete("/delete-relayed-message/:messageId", async (req, res) => {
  * Enforces "1 channel per user" via a unique index on ownerPubKey.
  */
 app.post("/channels/create", async (req, res) => {
-    const { payload, signature } = req.body;
-    if (!payload || !signature || !payload.pubKey || !payload.channelName) {
-        return res.status(400).json({ error: "Missing required payload or signature." });
+    const { payloadString, signature } = req.body;
+    if (!payloadString || !signature) {
+        return res.status(400).json({ error: "Missing required payloadString or signature." });
     }
 
     // 1. Re-create the exact string that the client signed
