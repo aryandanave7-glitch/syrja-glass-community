@@ -107,7 +107,7 @@ async function verifySignature(pubKeyB64, signatureB64, data) {
     });
 
     const verify = crypto.createVerify('SHA-256');
-    verify.update(data); 
+    verify.update(data, 'utf8'); 
     verify.end();
 
     const signature = Buffer.from(signatureB64, 'base64');
