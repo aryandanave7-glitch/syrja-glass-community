@@ -552,25 +552,27 @@ app.delete("/delete-relayed-message/:messageId", async (req, res) => {
  * Enforces "1 channel per user" via a unique index on ownerPubKey.
  */
 app.post("/channels/create", async (req, res) => {
-    const { channelName, description, avatar, pubKey, signature } = req.body;
-    if (!channelName || !pubKey || !signature) {
-        return res.status(400).json({ error: "Missing required fields." });
+    const { payload, signature } = req.body;
+    if (!payload || !signature || !payload.pubKey || !payload.channelName) {
+        return res.status(400).json({ error: "Missing required payload or signature." });
     }
 
-    // 1. Verify the signature to prove ownership
-    // We sign the channel name as the "data" to prove intent
-    const isOwner = await verifySignature(pubKey, signature, channelName);
+    // 1. Re-create the exact string that the client signed
+    const dataToVerify = JSON.stringify(payload);
+
+    // 2. Verify the signature against the stringified payload
+    const isOwner = await verifySignature(payload.pubKey, signature, dataToVerify);
     if (!isOwner) {
         return res.status(403).json({ error: "Invalid signature. Cannot create channel." });
     }
 
     try {
-        // 2. Try to insert the new channel
+        // 3. Try to insert the new channel (using data from the *verified* payload)
         const newChannel = {
-            ownerPubKey: pubKey,
-            channelName,
-            description: description || "",
-            avatar: avatar || null,
+            ownerPubKey: payload.pubKey,
+            channelName: payload.channelName,
+            description: payload.description || "",
+            avatar: payload.avatar || null,
             followerCount: 0,
             createdAt: new Date()
         };
