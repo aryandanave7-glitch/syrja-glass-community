@@ -558,7 +558,19 @@ app.post("/channels/create", async (req, res) => {
     }
 
     // 1. Re-create the exact string that the client signed
-    const dataToVerify = JSON.stringify(payload);
+    const dataToVerify = payloadString;
+
+    let payload;
+    try {
+        payload = JSON.parse(payloadString);
+    } catch (e) {
+        return res.status(400).json({ error: "Invalid payload format." });
+    }
+
+    // 5. Check for required fields inside the parsed object
+    if (!payload.pubKey || !payload.channelName) {
+         return res.status(400).json({ error: "Payload missing pubKey or channelName." });
+    }
 
     // 2. Verify the signature against the stringified payload
     const isOwner = await verifySignature(payload.pubKey, signature, dataToVerify);
