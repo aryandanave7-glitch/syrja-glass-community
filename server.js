@@ -106,7 +106,8 @@ async function verifySignature(pubKeyB64, signatureB64, data) {
 
     // 3. Verify the signature
     const signature = Buffer.from(signatureB64, 'base64');
-    return verify.verify(key, signature, 'ieee-p1363');
+    return verify.verify(key, signature);
+      
   } catch (err) {
     console.error("Signature verification error:", err.message);
     return false;
@@ -591,7 +592,7 @@ app.post("/channels/create", async (req, res) => {
         // Use insertOne and catch the error
         await channelsCollection.insertOne(newChannel);
 
-        console.log(`✅ Channel Created: ${channelName} by ${pubKey.slice(0, 10)}...`);
+        console.log(`✅ Channel Created: ${payload.channelName} by ${payload.pubKey.slice(0, 10)}...`);
         res.status(201).json(newChannel); // Return the new channel object
 
     } catch (err) {
