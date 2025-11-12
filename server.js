@@ -106,7 +106,7 @@ async function verifySignature(pubKeyB64, signatureB64, data) {
 
     // 3. Verify the signature
     const signature = Buffer.from(signatureB64, 'base64');
-    return verify.verify(key, signature);
+    return verify.verify(key, signature, 'ieee-p1363');
   } catch (err) {
     console.error("Signature verification error:", err.message);
     return false;
