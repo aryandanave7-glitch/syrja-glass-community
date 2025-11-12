@@ -92,30 +92,41 @@ async function connectToMongo() {
  */
 // In server.js
 
+// In server.js
+
 async function verifySignature(pubKeyB64, signatureB64, data) {
+  // --- NEW LOGGING V3 ---
+  // We will look for this exact message in your Render logs.
+  console.log("--- [Syrja-Debug-V3] INSIDE THE NEW VERIFY SIGNATURE FUNCTION ---"); 
+  
   try {
-    // 1. Create a public key object from the Base64 SPKI
     const key = crypto.createPublicKey({
       key: Buffer.from(pubKeyB64, 'base64'),
       format: 'der',
       type: 'spki'
     });
 
-    // 2. Create a verify object
     const verify = crypto.createVerify('SHA-256');
-    verify.update(data); // Add the original data
+    verify.update(data); 
     verify.end();
 
-    // 3. Verify the signature
     const signature = Buffer.from(signatureB64, 'base64');
     
-    // --- THIS IS THE FIX ---
-    // Remove the 'ieee-p1363' argument. The default (DER) is correct.
-    return verify.verify(key, signature); 
-    // --- END FIX ---
+    // Log the data we are about to check
+    console.log(`[Syrja-Debug-V3] Verifying pubKey (first 20): ${pubKeyB64.slice(0, 20)}...`);
+    console.log(`[Syrja-Debug-V3] Verifying data (first 50): ${data.slice(0, 50)}...`);
 
+    // This is the fixed line (no 'ieee-p1363')
+    const result = verify.verify(key, signature); 
+    
+    // Log the result
+    console.log(`[Syrja-Debug-V3] SIGNATURE VERIFICATION RESULT: ${result}`);
+    // --- END NEW LOGGING ---
+
+    return result; 
+  
   } catch (err) {
-    console.error("Signature verification error:", err.message);
+    console.error("[Syrja-Debug-V3] Signature verification CRASHED:", err.message);
     return false;
   }
 }
