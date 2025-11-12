@@ -94,11 +94,12 @@ async function connectToMongo() {
 
 // In server.js
 
+// In server.js
+
 async function verifySignature(pubKeyB64, signatureB64, data) {
-  // --- NEW LOGGING V3 ---
-  // We will look for this exact message in your Render logs.
-  console.log("--- [Syrja-Debug-V3] INSIDE THE NEW VERIFY SIGNATURE FUNCTION ---"); 
-  
+  // --- [Syrja-Debug-V5] ---
+  console.log("--- [Syrja-Debug-V5] INSIDE FINAL VERIFY SIGNATURE FUNCTION ---"); 
+ 
   try {
     const key = crypto.createPublicKey({
       key: Buffer.from(pubKeyB64, 'base64'),
@@ -107,26 +108,29 @@ async function verifySignature(pubKeyB64, signatureB64, data) {
     });
 
     const verify = crypto.createVerify('SHA-256');
+    // Keep this fix: Explicitly use 'utf8' to match the client
     verify.update(data, 'utf8'); 
     verify.end();
 
     const signature = Buffer.from(signatureB64, 'base64');
-    
-    // Log the data we are about to check
-    console.log(`[Syrja-Debug-V3] Verifying pubKey (first 20): ${pubKeyB64.slice(0, 20)}...`);
-    console.log(`[Syrja-Debug-V3] Verifying data (first 50): ${data.slice(0, 50)}...`);
+   
+    console.log(`[Syrja-Debug-V5] Verifying data (first 50): ${data.slice(0, 50)}...`);
 
-    // This is the fixed line (no 'ieee-p1363')
-    const result = verify.verify(key, signature); 
-    
-    // Log the result
-    console.log(`[Syrja-Debug-V3] SIGNATURE VERIFICATION RESULT: ${result}`);
-    // --- END NEW LOGGING ---
+    // --- THIS IS THE FINAL FIX ---
+    // We must provide the signature *format* here.
+    // The key is an object specifying the DSA encoding format.
+    const result = verify.verify(
+      { key: key, dsaEncoding: 'ieee-p1363' }, 
+      signature
+    ); 
+    // --- END FINAL FIX ---
+   
+    console.log(`[Syrja-Debug-V5] SIGNATURE VERIFICATION RESULT: ${result}`);
 
     return result; 
-  
+ 
   } catch (err) {
-    console.error("[Syrja-Debug-V3] Signature verification CRASHED:", err.message);
+    console.error("[Syrja-Debug-V5] Signature verification CRASHED:", err.message);
     return false;
   }
 }
@@ -603,8 +607,8 @@ app.post("/channels/create", async (req, res) => {
     // 5. Verify the signature against the *original string*
     const isOwner = await verifySignature(payload.pubKey, signature, dataToVerify);
     if (!isOwner) {
-        console.log("[Syrja-Debug-V4] VERIFICATION FAILED. SENDING V4 ERROR.");
-        return res.status(403).json({ error: "V4_SIGNATURE_MISMATCH_ERROR" });
+        console.log("[Syrja-Debug-V5] VERIFICATION FAILED. Sending original error.");
+        return res.status(403).json({ error: "Invalid signature. Cannot create channel." });
     }
 
     // 6. Proceed to insert into DB
