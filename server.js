@@ -90,6 +90,8 @@ async function connectToMongo() {
  * @param {string} data - The original string data that was signed.
  * @returns {Promise<boolean>} - True if the signature is valid, false otherwise.
  */
+// In server.js
+
 async function verifySignature(pubKeyB64, signatureB64, data) {
   try {
     // 1. Create a public key object from the Base64 SPKI
@@ -106,8 +108,12 @@ async function verifySignature(pubKeyB64, signatureB64, data) {
 
     // 3. Verify the signature
     const signature = Buffer.from(signatureB64, 'base64');
-    return verify.verify(key, signature);
-      
+    
+    // --- THIS IS THE FIX ---
+    // Remove the 'ieee-p1363' argument. The default (DER) is correct.
+    return verify.verify(key, signature); 
+    // --- END FIX ---
+
   } catch (err) {
     console.error("Signature verification error:", err.message);
     return false;
@@ -552,15 +558,20 @@ app.delete("/delete-relayed-message/:messageId", async (req, res) => {
  * [AUTHENTICATED] Create a new channel.
  * Enforces "1 channel per user" via a unique index on ownerPubKey.
  */
+// In server.js
+
 app.post("/channels/create", async (req, res) => {
+    // 1. Receive the payloadString and signature
     const { payloadString, signature } = req.body;
+    
     if (!payloadString || !signature) {
         return res.status(400).json({ error: "Missing required payloadString or signature." });
     }
 
-    // 1. Re-create the exact string that the client signed
+    // 2. This is the *exact* string the client signed
     const dataToVerify = payloadString;
-
+    
+    // 3. Parse the string to get the payload object
     let payload;
     try {
         payload = JSON.parse(payloadString);
@@ -568,19 +579,19 @@ app.post("/channels/create", async (req, res) => {
         return res.status(400).json({ error: "Invalid payload format." });
     }
 
-    // 5. Check for required fields inside the parsed object
+    // 4. Check for fields *inside* the parsed object
     if (!payload.pubKey || !payload.channelName) {
-         return res.status(400).json({ error: "Payload missing pubKey or channelName." });
+       return res.status(400).json({ error: "Payload missing pubKey or channelName." });
     }
 
-    // 2. Verify the signature against the stringified payload
+    // 5. Verify the signature against the *original string*
     const isOwner = await verifySignature(payload.pubKey, signature, dataToVerify);
     if (!isOwner) {
         return res.status(403).json({ error: "Invalid signature. Cannot create channel." });
     }
 
+    // 6. Proceed to insert into DB
     try {
-        // 3. Try to insert the new channel (using data from the *verified* payload)
         const newChannel = {
             ownerPubKey: payload.pubKey,
             channelName: payload.channelName,
@@ -589,22 +600,22 @@ app.post("/channels/create", async (req, res) => {
             followerCount: 0,
             createdAt: new Date()
         };
-        // Use insertOne and catch the error
+        
         await channelsCollection.insertOne(newChannel);
 
+        // Use the parsed payload for logging
         console.log(`✅ Channel Created: ${payload.channelName} by ${payload.pubKey.slice(0, 10)}...`);
-        res.status(201).json(newChannel); // Return the new channel object
+        
+        res.status(201).json(newChannel); 
 
     } catch (err) {
-        // 3. If the insert fails with a "duplicate key" error, the user already has a channel.
-        if (err.code === 11000) { // E11000 is the MongoDB duplicate key error
+        if (err.code === 11000) { 
             return res.status(409).json({ error: "You can only create one channel per account." });
         }
         console.error("Channel creation error:", err);
         res.status(500).json({ error: "Server error creating channel." });
     }
 });
-
 /**
  * [AUTHENTICATED] Post a new update to a channel.
  */
