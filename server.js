@@ -2,8 +2,10 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
-const { MongoClient, ServerApiVersion } = require("mongodb"); // Import MongoDB client
+const crypto = require('crypto');
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb"); // Import MongoDB client & ObjectId
 
+// --- START: MongoDB Setup ---
 // --- START: MongoDB Setup ---
 // IMPORTANT: Use Environment Variable in Production (See Step 4 later)
 // For now, paste your connection string here during testing, BUT REMEMBER TO CHANGE IT
@@ -25,6 +27,9 @@ const mongoClient = new MongoClient(mongoUri, {
 
 let db; // To hold the database connection
 let idsCollection; // To hold the collection reference
+let offlineMessagesCollection;
+let channelsCollection; // For channel info
+let channelUpdatesCollection; // For channel messages
 
 async function connectToMongo() {
   try {
@@ -49,7 +54,27 @@ async function connectToMongo() {
 
     console.log("✅ Offline messages collection and indexes are ready.");
     // --- END NEW ---
+    // --- NEW: Setup for Channels ---
+    channelsCollection = db.collection("channels");
+    channelUpdatesCollection = db.collection("channelUpdates");
 
+    // 1. Create a UNIQUE index on ownerPubKey for the 'channels' collection
+    // This automatically enforces your "1 channel per user" rule.
+    await channelsCollection.createIndex({ ownerPubKey: 1 }, { unique: true });
+
+    // 2. Create a TEXT index on name/description for searching
+    await channelsCollection.createIndex({ channelName: "text", description: "text" });
+
+    // 3. Create a TTL index for 24-hour message expiry
+    // This is your 24-hour deletion rule. MongoDB handles it automatically.
+    // 86400 seconds = 24 hours
+    await channelUpdatesCollection.createIndex({ "createdAt": 1 }, { expireAfterSeconds: 86400 });
+
+    // 4. Create an index on channelId for fast message lookups
+    await channelUpdatesCollection.createIndex({ channelId: 1 });
+
+    console.log("✅ Channels collections and indexes are ready.");
+    // --- END NEW ---
     console.log("✅ Connected successfully to MongoDB Atlas");
   } catch (err) {
     console.error("❌ Failed to connect to MongoDB Atlas", err);
@@ -58,6 +83,35 @@ async function connectToMongo() {
 }
 // --- END: MongoDB Setup ---
 
+/**
+ * Verifies an ECDSA (P-256) signature.
+ * @param {string} pubKeyB64 - The SPKI public key in Base64.
+ * @param {string} signatureB64 - The Base64 encoded signature.
+ * @param {string} data - The original string data that was signed.
+ * @returns {Promise<boolean>} - True if the signature is valid, false otherwise.
+ */
+async function verifySignature(pubKeyB64, signatureB64, data) {
+  try {
+    // 1. Create a public key object from the Base64 SPKI
+    const key = crypto.createPublicKey({
+      key: Buffer.from(pubKeyB64, 'base64'),
+      format: 'der',
+      type: 'spki'
+    });
+
+    // 2. Create a verify object
+    const verify = crypto.createVerify('SHA-256');
+    verify.update(data); // Add the original data
+    verify.end();
+
+    // 3. Verify the signature
+    const signature = Buffer.from(signatureB64, 'base64');
+    return verify.verify(key, signature);
+  } catch (err) {
+    console.error("Signature verification error:", err.message);
+    return false;
+  }
+}
 
 // Simple word lists for more memorable IDs
 const ADJECTIVES = ["alpha", "beta", "gamma", "delta", "zeta", "nova", "comet", "solar", "lunar", "star"];
