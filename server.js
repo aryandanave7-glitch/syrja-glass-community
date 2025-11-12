@@ -545,6 +545,195 @@ app.delete("/delete-relayed-message/:messageId", async (req, res) => {
 
 
 // --- END: Syrja ID Directory Service (v2) ---
+// --- START: Channels API Endpoints ---
+
+/**
+ * [AUTHENTICATED] Create a new channel.
+ * Enforces "1 channel per user" via a unique index on ownerPubKey.
+ */
+app.post("/channels/create", async (req, res) => {
+    const { channelName, description, avatar, pubKey, signature } = req.body;
+    if (!channelName || !pubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    // 1. Verify the signature to prove ownership
+    // We sign the channel name as the "data" to prove intent
+    const isOwner = await verifySignature(pubKey, signature, channelName);
+    if (!isOwner) {
+        return res.status(403).json({ error: "Invalid signature. Cannot create channel." });
+    }
+
+    try {
+        // 2. Try to insert the new channel
+        const newChannel = {
+            ownerPubKey: pubKey,
+            channelName,
+            description: description || "",
+            avatar: avatar || null,
+            followerCount: 0,
+            createdAt: new Date()
+        };
+        // Use insertOne and catch the error
+        await channelsCollection.insertOne(newChannel);
+
+        console.log(`✅ Channel Created: ${channelName} by ${pubKey.slice(0, 10)}...`);
+        res.status(201).json(newChannel); // Return the new channel object
+
+    } catch (err) {
+        // 3. If the insert fails with a "duplicate key" error, the user already has a channel.
+        if (err.code === 11000) { // E11000 is the MongoDB duplicate key error
+            return res.status(409).json({ error: "You can only create one channel per account." });
+        }
+        console.error("Channel creation error:", err);
+        res.status(500).json({ error: "Server error creating channel." });
+    }
+});
+
+/**
+ * [AUTHENTICATED] Post a new update to a channel.
+ */
+app.post("/channels/post", async (req, res) => {
+    const { channelId, content, pubKey, signature } = req.body;
+    if (!channelId || !content || !pubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    try {
+        // 1. Find the channel
+        const channel = await channelsCollection.findOne({ _id: new ObjectId(channelId) });
+        if (!channel) {
+            return res.status(404).json({ error: "Channel not found." });
+        }
+
+        // 2. Verify the poster is the owner
+        if (channel.ownerPubKey !== pubKey) {
+            return res.status(403).json({ error: "You are not the owner of this channel." });
+        }
+
+        // 3. Verify the signature (owner signed the content)
+        const isAuthentic = await verifySignature(pubKey, signature, content);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid message signature." });
+        }
+
+        // 4. Store the public message
+        const newUpdate = {
+            channelId: new ObjectId(channelId),
+            content,
+            signature, // Store the signature for client-side verification
+            createdAt: new Date()
+            // The TTL index will handle deletion in 24h
+        };
+        await channelUpdatesCollection.insertOne(newUpdate);
+
+        console.log(`📢 New post in channel: ${channel.channelName}`);
+        res.status(201).json({ success: true, message: newUpdate });
+
+    } catch (err) {
+        console.error("Channel post error:", err);
+        res.status(500).json({ error: "Server error posting update." });
+    }
+});
+
+/**
+ * [ANONYMOUS] Get top 10 channels (by follower count)
+ */
+app.get("/channels/discover/top", async (req, res) => {
+    try {
+        const topChannels = await channelsCollection
+            .find()
+            .sort({ followerCount: -1 }) // Sort by followers
+            .limit(10) // Get top 10
+            .toArray();
+        res.json(topChannels);
+    } catch (err) {
+        res.status(500).json({ error: "Server error." });
+    }
+});
+
+/**
+ * [ANONYMOUS] Search for channels by name/description
+ */
+app.get("/channels/discover/search", async (req, res) => {
+    const query = req.query.q;
+    if (!query) {
+        return res.status(400).json({ error: "Missing search query 'q'." });
+    }
+
+    try {
+        const results = await channelsCollection
+            .find({ $text: { $search: query } })
+            .toArray();
+        res.json(results);
+    } catch (err) {
+        res.status(500).json({ error: "Server error." });
+    }
+});
+
+/**
+ * [ANONYMOUS] Fetch new messages for followed channels.
+ * This is the main "pull" endpoint for followers.
+ */
+app.post("/channels/fetch", async (req, res) => {
+    const { channels } = req.body; // e.g., [{ id: "...", since: "..." }]
+    if (!Array.isArray(channels) || channels.length === 0) {
+        return res.json([]);
+    }
+
+    try {
+        // Build a query for each channel
+        const queries = channels.map(c => ({
+            channelId: new ObjectId(c.id),
+            createdAt: { $gt: new Date(c.since) }
+        }));
+
+        // Find all messages matching any of the queries
+        const allNewMessages = await channelUpdatesCollection
+            .find({ $or: queries })
+            .sort({ createdAt: 1 }) // Send oldest-to-newest
+            .toArray();
+
+        res.json(allNewMessages);
+
+    } catch (err) {
+        console.error("Channel fetch error:", err);
+        res.status(500).json({ error: "Server error fetching updates." });
+    }
+});
+
+/**
+ * [ANONYMOUS] Anonymously increment a channel's follower count.
+ */
+app.post("/channels/follow/:id", async (req, res) => {
+    try {
+        await channelsCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $inc: { followerCount: 1 } }
+        );
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Server error." });
+    }
+});
+
+/**
+ * [ANONYMOUS] Anonymously decrement a channel's follower count.
+ */
+app.post("/channels/unfollow/:id", async (req, res) => {
+    try {
+        await channelsCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $inc: { followerCount: -1 } }
+        );
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Server error." });
+    }
+});
+
+// --- END: Channels API Endpoints ---
+
 // --- START: Simple Rate Limiting ---
 const rateLimit = new Map();
 const LIMIT = 20; // Max 20 requests
