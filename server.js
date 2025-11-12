@@ -603,7 +603,8 @@ app.post("/channels/create", async (req, res) => {
     // 5. Verify the signature against the *original string*
     const isOwner = await verifySignature(payload.pubKey, signature, dataToVerify);
     if (!isOwner) {
-        return res.status(403).json({ error: "Invalid signature. Cannot create channel." });
+        console.log("[Syrja-Debug-V4] VERIFICATION FAILED. SENDING V4 ERROR.");
+        return res.status(403).json({ error: "V4_SIGNATURE_MISMATCH_ERROR" });
     }
 
     // 6. Proceed to insert into DB
