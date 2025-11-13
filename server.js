@@ -5,6 +5,19 @@ const cors = require("cors");
 const crypto = require('crypto');
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb"); // Import MongoDB client & ObjectId
 
+
+// --- NEW: Utility Function for Logging ---
+function formatBytes(bytes, decimals = 2) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+// --- END NEW ---
+
+
 // --- START: MongoDB Setup ---
 // --- START: MongoDB Setup ---
 // IMPORTANT: Use Environment Variable in Production (See Step 4 later)
