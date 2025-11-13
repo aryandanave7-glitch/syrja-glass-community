@@ -100,7 +100,22 @@ async function connectToMongo() {
     
     console.log("✅ Permanent posts collection and indexes are ready.");
     // --- END NEW ---
-      
+
+    // server.js (Added after the "Permanent posts collection" log)
+    
+    // --- NEW: Setup for Auto-Cached Channel Posts (Task 1.1) ---
+    autoCachedPostsCollection = db.collection("autoCachedPosts");
+
+    // 1. Index for finding all cached posts for a channel
+    await autoCachedPostsCollection.createIndex({ channelId: 1 });
+    // 2. Index for finding the oldest posts to delete (FIFO)
+    await autoCachedPostsCollection.createIndex({ channelId: 1, createdAt: 1 });
+    // 3. Add TTL index (24h) as a fallback safety measure
+    // This ensures posts are still deleted if the FIFO logic fails
+    await autoCachedPostsCollection.createIndex({ "createdAt": 1 }, { expireAfterSeconds: 86400 });
+
+    console.log("✅ Auto-cached posts collection and indexes are ready.");
+    // --- END NEW ---
     // --- END NEW ---
     console.log("✅ Connected successfully to MongoDB Atlas");
   } catch (err) {
@@ -648,7 +663,8 @@ app.post("/channels/create", async (req, res) => {
             followerCount: 0,
             createdAt: new Date(),
             permanentStorageUsed: 0, // Start with 0 bytes used
-            permanentStorageQuota: 2 * 1024 * 1024 // Set 2MB quota
+            permanentStorageQuota: 2 * 1024 * 1024, // Set 2MB quota
+            autoCacheQuota: 0
             // --- END NEW ---
         };
         
@@ -855,6 +871,66 @@ app.get("/channels/permanent-posts/:pubKey", async (req, res) => {
     }
 });
 
+// server.js (Added after the /channels/permanent-posts endpoint)
+
+/**
+ * [AUTHENTICATED] Set the auto-cache quota for a channel.
+ */
+app.post("/channels/set-auto-cache", async (req, res) => {
+    // 1. Get the signed payload
+    const { payloadString, signature } = req.body;
+    if (!payloadString || !signature) {
+        return res.status(400).json({ error: "Missing required payloadString or signature." });
+    }
+
+    // 2. Parse the payload
+    let payload;
+    try {
+        payload = JSON.parse(payloadString);
+    } catch (e) {
+        return res.status(400).json({ error: "Invalid payload format." });
+    }
+
+    const { pubKey, autoCacheQuota } = payload;
+    // autoCacheQuota can be 0, so we check if it's undefined
+    if (!pubKey || autoCacheQuota === undefined) {
+       return res.status(400).json({ error: "Payload missing pubKey or autoCacheQuota." });
+    }
+    
+    // 3. Validate the new quota
+    const newQuota = parseInt(autoCacheQuota, 10);
+    const MAX_AUTO_CACHE = 1 * 1024 * 1024; // 1MB
+    if (isNaN(newQuota) || newQuota < 0 || newQuota > MAX_AUTO_CACHE) {
+        return res.status(400).json({ error: `Invalid quota. Must be a number between 0 and ${MAX_AUTO_CACHE}.`});
+    }
+
+    try {
+        // 4. Verify the signature (Owner signed the payload string to confirm)
+        const isAuthentic = await verifySignature(pubKey, signature, payloadString);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid signature." });
+        }
+        
+        // 5. Find the channel and update its quota
+        const updateResult = await channelsCollection.updateOne(
+            { ownerPubKey: pubKey },
+            { $set: { autoCacheQuota: newQuota } }
+        );
+        
+        if (updateResult.matchedCount === 0) {
+            return res.status(404).json({ error: "Channel not found for this public key." });
+        }
+        
+        console.log(`... Auto-Cache Quota Set: ${formatBytes(newQuota)} for owner ${pubKey.slice(0, 10)}...`);
+        res.status(200).json({ success: true, newQuota: newQuota });
+
+    } catch (err) {
+        console.error("Set auto-cache error:", err);
+        res.status(500).json({ error: "Server error setting auto-cache." });
+    }
+});
+
+
 /**
  * [AUTHENTICATED] Post a new update to a channel.
  */
@@ -891,6 +967,56 @@ app.post("/channels/post", async (req, res) => {
             // The TTL index will handle deletion in 24h
         };
         await channelUpdatesCollection.insertOne(newUpdate);
+        // server.js (Added after the channelUpdatesCollection.insertOne line)
+
+        // --- NEW: Auto-Cache (FIFO) Logic (Task 1.4) ---
+        if (channel.autoCacheQuota && channel.autoCacheQuota > 0) {
+            try {
+                const postSize = Buffer.byteLength(content, 'utf8');
+
+                // 1. Copy the post to the auto-cache collection
+                const cachedPost = {
+                    _id: newUpdate._id, // Use the same ID
+                    channelId: newUpdate.channelId,
+                    content: newUpdate.content,
+                    signature: newUpdate.signature,
+                    createdAt: newUpdate.createdAt,
+                    size: postSize // Store the size for quota math
+                };
+                await autoCachedPostsCollection.insertOne(cachedPost);
+
+                // 2. Check and enforce the quota
+                const allCachedPosts = await autoCachedPostsCollection.find(
+                    { channelId: channel._id },
+                    { projection: { createdAt: 1, size: 1 } }
+                ).sort({ createdAt: 1 }).toArray(); // Get all posts, oldest first
+
+                let totalSize = allCachedPosts.reduce((sum, post) => sum + (post.size || 0), 0);
+
+                if (totalSize > channel.autoCacheQuota) {
+                    log(`... Auto-Cache: Quota exceeded (${formatBytes(totalSize)} / ${formatBytes(channel.autoCacheQuota)}). Pruning...`);
+                    const postsToDelete = [];
+                    // Keep deleting oldest posts until we are under quota
+                    for (const post of allCachedPosts) {
+                        if (totalSize <= channel.autoCacheQuota) {
+                            break; // We're under quota
+                        }
+                        postsToDelete.push(post._id);
+                        totalSize -= post.size;
+                    }
+                    
+                    if (postsToDelete.length > 0) {
+                        await autoCachedPostsCollection.deleteMany({ _id: { $in: postsToDelete } });
+                        log(`... Auto-Cache: Pruned ${postsToDelete.length} old posts.`);
+                    }
+                }
+                
+            } catch (cacheErr) {
+                // Log the error but don't fail the whole post
+                console.error("Auto-cache logic failed:", cacheErr.message);
+            }
+        }
+        // --- END NEW ---
 
         console.log(`📢 New post in channel: ${channel.channelName}`);
         res.status(201).json({ success: true, message: newUpdate });
@@ -940,9 +1066,10 @@ app.get("/channels/discover/search", async (req, res) => {
     }
 });
 // server.js (REPLACING the /channels/fetch endpoint)
+// server.js (REPLACING the /channels/fetch endpoint)
 /**
  * [ANONYMOUS] Fetch new messages for followed channels.
- * Fetches BOTH 24-hour TTL posts AND all permanent posts.
+ * Fetches 24-hour TTL, permanent-pinned, and auto-cached posts.
  */
 app.post("/channels/fetch", async (req, res) => {
     const { channels } = req.body; // e.g., [{ id: "...", since: "..." }]
@@ -951,7 +1078,7 @@ app.post("/channels/fetch", async (req, res) => {
     }
 
     try {
-        // --- 1. Build Queries for BOTH Collections ---
+        // --- 1. Build Queries for ALL THREE Collections ---
         
         // Query 1: Get 24-hour posts created *since* the last check
         const ttlQueries = channels.map(c => ({
@@ -959,30 +1086,35 @@ app.post("/channels/fetch", async (req, res) => {
             createdAt: { $gt: new Date(c.since) }
         }));
         
-        // Query 2: Get ALL permanent posts for these channels
+        // Query 2 & 3: Get ALL permanent and auto-cached posts for these channels
         const channelIds = channels.map(c => new ObjectId(c.id));
         const permanentQuery = {
             channelId: { $in: channelIds }
         };
 
         // --- 2. Execute Queries in Parallel ---
-        const [ttlMessages, permanentMessages] = await Promise.all([
+        const [ttlMessages, permanentMessages, autoCachedMessages] = await Promise.all([
             channelUpdatesCollection.find(ttlQueries.length ? { $or: ttlQueries } : {}).toArray(),
-            permanentPostsCollection.find(permanentQuery).toArray()
+            permanentPostsCollection.find(permanentQuery).toArray(),
+            autoCachedPostsCollection.find(permanentQuery).toArray() // <-- NEW
         ]);
 
         // --- 3. Merge and De-duplicate ---
-        // We use a Map to ensure permanent posts (which have the same _id
-        // as a 24-hour post) and any other duplicates are handled.
+        // We use a Map to ensure posts are not duplicated.
+        // The order here is important.
         const messageMap = new Map();
         
-        // Add all 24-hour messages first
+        // Add 24-hour messages first (least important)
         for (const msg of ttlMessages) {
             messageMap.set(msg._id.toString(), msg);
         }
         
-        // Add all permanent messages (overwriting any 24-hour ones)
-        // This ensures the permanent version is always the one sent
+        // Add auto-cached messages (overwrites 24-hour)
+        for (const msg of autoCachedMessages) {
+            messageMap.set(msg._id.toString(), msg);
+        }
+        
+        // Add permanent-pinned messages last (overwrites everything)
         for (const msg of permanentMessages) {
             messageMap.set(msg._id.toString(), msg);
         }
@@ -1000,7 +1132,6 @@ app.post("/channels/fetch", async (req, res) => {
         res.status(500).json({ error: "Server error fetching updates." });
     }
 });
-
 /**
  * [ANONYMOUS] Anonymously increment a channel's follower count.
  */
