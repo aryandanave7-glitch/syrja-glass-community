@@ -834,6 +834,112 @@ app.post("/channels/delete-post", async (req, res) => {
         res.status(500).json({ error: "Server error deleting post." });
     }
 });
+// server.js (Added after the /channels/delete-post endpoint)
+
+/**
+ * [ANONYMOUS] Get public metadata for a single channel.
+ * Used for populating the channel info panel.
+ */
+app.get("/channels/meta/:id", async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const channel = await channelsCollection.findOne(
+            { _id: new ObjectId(id) },
+            {
+                // Projection: Only return these specific, safe fields
+                projection: {
+                    channelName: 1,
+                    description: 1,
+                    avatar: 1,
+                    followerCount: 1
+                }
+            }
+        );
+
+        if (!channel) {
+            return res.status(404).json({ error: "Channel not found." });
+        }
+
+        // 'channel' object will only contain _id, channelName, description, avatar, followerCount
+        res.status(200).json(channel);
+
+    } catch (err) {
+        console.error("Get channel meta error:", err);
+        res.status(500).json({ error: "Server error or invalid ID." });
+    }
+});
+// server.js (Added after the /channels/meta/:id endpoint)
+
+/**
+ * [AUTHENTICATED] Update a channel's metadata (avatar, description).
+ * Verifies ownership before updating.
+ */
+app.post("/channels/update-meta", async (req, res) => {
+    // 1. Get the signed payload
+    const { payloadString, signature } = req.body;
+    if (!payloadString || !signature) {
+        return res.status(400).json({ error: "Missing required payloadString or signature." });
+    }
+
+    // 2. Parse the payload
+    let payload;
+    try {
+        payload = JSON.parse(payloadString);
+    } catch (e) {
+        return res.status(400).json({ error: "Invalid payload format." });
+    }
+
+    const { channelId, pubKey, description, avatar } = payload;
+    if (!channelId || !pubKey) {
+       return res.status(400).json({ error: "Payload missing channelId or pubKey." });
+    }
+
+    try {
+        // 3. Find the channel
+        const channel = await channelsCollection.findOne({ _id: new ObjectId(channelId) });
+        if (!channel) {
+            return res.status(404).json({ error: "Channel not found." });
+        }
+
+        // 4. Verify the poster is the owner
+        if (channel.ownerPubKey !== pubKey) {
+            return res.status(403).json({ error: "You are not the owner of this channel." });
+        }
+
+        // 5. Verify the signature (owner signed the *entire payload string*)
+        const isAuthentic = await verifySignature(pubKey, signature, payloadString);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid signature." });
+        }
+
+        // 6. Build the update document (only update fields that were provided)
+        const fieldsToUpdate = {};
+        if (description !== undefined) {
+            fieldsToUpdate.description = description;
+        }
+        if (avatar !== undefined) {
+            fieldsToUpdate.avatar = avatar; // This can be a data URL or null
+        }
+
+        // 7. Perform the update
+        if (Object.keys(fieldsToUpdate).length > 0) {
+            await channelsCollection.updateOne(
+                { _id: new ObjectId(channelId) },
+                { $set: fieldsToUpdate }
+            );
+            console.log(`✅ Channel Meta Updated: ${channel.channelName} by ${pubKey.slice(0, 10)}...`);
+        } else {
+            console.log(`ℹ️ Channel Meta: No fields to update for ${channel.channelName}.`);
+        }
+
+        res.status(200).json({ success: true, message: "Channel updated." });
+
+    } catch (err) {
+        console.error("Channel meta update error:", err);
+        res.status(500).json({ error: "Server error updating channel." });
+    }
+});
 
 // --- START: Simple Rate Limiting ---
 const rateLimit = new Map();
