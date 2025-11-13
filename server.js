@@ -784,6 +784,56 @@ app.post("/channels/unfollow/:id", async (req, res) => {
 });
 
 // --- END: Channels API Endpoints ---
+// server.js (Added after the /unfollow endpoint)
+
+/**
+ * [AUTHENTICATED] Delete a post from a channel.
+ * Verifies ownership before deleting.
+ */
+app.post("/channels/delete-post", async (req, res) => {
+    // We sign the postId to prove ownership and prevent replay attacks
+    const { postId, pubKey, signature } = req.body;
+    
+    if (!postId || !pubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields (postId, pubKey, signature)." });
+    }
+
+    try {
+        // 1. Find the post to get the channelId
+        const post = await channelUpdatesCollection.findOne({ _id: new ObjectId(postId) });
+        if (!post) {
+            return res.status(404).json({ error: "Post not found." });
+        }
+
+        // 2. Find the channel to verify the owner
+        const channel = await channelsCollection.findOne({ _id: new ObjectId(post.channelId) });
+        if (!channel) {
+            return res.status(404).json({ error: "Channel not found." });
+        }
+
+        // 3. Verify the poster is the owner
+        if (channel.ownerPubKey !== pubKey) {
+            return res.status(403).json({ error: "You are not the owner of this channel." });
+        }
+
+        // 4. Verify the signature (owner signed the *postId* to confirm deletion)
+        // This proves they are actively deleting *this specific post*
+        const isAuthentic = await verifySignature(pubKey, signature, postId);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid deletion signature." });
+        }
+
+        // 5. Delete the post
+        await channelUpdatesCollection.deleteOne({ _id: new ObjectId(postId) });
+
+        console.log(`🗑️ Post Deleted: ${postId} from channel ${channel.channelName}`);
+        res.status(200).json({ success: true, message: "Post deleted." });
+
+    } catch (err) {
+        console.error("Channel post deletion error:", err);
+        res.status(500).json({ error: "Server error deleting post." });
+    }
+});
 
 // --- START: Simple Rate Limiting ---
 const rateLimit = new Map();
