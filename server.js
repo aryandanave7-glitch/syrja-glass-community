@@ -664,7 +664,8 @@ app.post("/channels/create", async (req, res) => {
             createdAt: new Date(),
             permanentStorageUsed: 0, // Start with 0 bytes used
             permanentStorageQuota: 2 * 1024 * 1024, // Set 2MB quota
-            autoCacheQuota: 0
+            autoCacheQuota: 0,
+            storageMode: "manual" // <-- NEW: Default all new channels to manual mode
             // --- END NEW ---
         };
         
@@ -704,10 +705,18 @@ app.post("/channels/pin-post", async (req, res) => {
         }
 
         // 2. Find the channel to get its quota and verify ownership
+        // 2. Find the channel to get its quota and verify ownership
         const channel = await channelsCollection.findOne({ ownerPubKey: pubKey });
         if (!channel) {
             return res.status(404).json({ error: "Channel not found for this public key." });
         }
+
+        // NEW RULE: Check storage mode
+        if (channel.storageMode !== "manual") {
+            return res.status(403).json({ error: "Cannot pin posts while in Auto-Cache mode." });
+        }
+        
+        // 3. Find the original 24-hour post
         
         // 3. Find the original 24-hour post
         const postToPin = await channelUpdatesCollection.findOne({ _id: new ObjectId(postId) });
@@ -790,6 +799,14 @@ app.post("/channels/unpin-post", async (req, res) => {
         if (!channel) {
             return res.status(404).json({ error: "Channel not found for this public key." });
         }
+
+        // NEW RULE: Check storage mode
+        if (channel.storageMode !== "manual") {
+            // Silently succeed, as the post isn't permanent anyway
+            return res.status(200).json({ success: true, message: "Post not permanent." });
+        }
+
+        // 3. Find the permanent post to be deleted
 
         // 3. Find the permanent post to be deleted
         const postToUnpin = await permanentPostsCollection.findOne({
@@ -975,7 +992,7 @@ app.post("/channels/post", async (req, res) => {
         // server.js (Added after the channelUpdatesCollection.insertOne line)
 
         // --- NEW: Auto-Cache (FIFO) Logic (Task 1.4) ---
-        if (channel.autoCacheQuota && channel.autoCacheQuota > 0) {
+        if (channel.storageMode === 'auto' && channel.autoCacheQuota && channel.autoCacheQuota > 0) {
             try {
                 const postSize = Buffer.byteLength(content, 'utf8');
 
@@ -1241,7 +1258,8 @@ app.get("/channels/meta/:id", async (req, res) => {
                     ownerPubKey: 1, // Need this to check ownership on client
                     permanentStorageUsed: 1,
                     permanentStorageQuota: 1,
-                    autoCacheQuota: 1
+                    autoCacheQuota: 1,
+                    storageMode: 1 // <-- ADD THIS LINE
                     // --- END NEW ---
                 }
             }
@@ -1377,6 +1395,68 @@ app.post("/channels/delete", async (req, res) => {
         res.status(500).json({ error: "Server error deleting channel." });
     }
 });
+
+});
+
+/**
+ * [AUTHENTICATED] Set the storage mode (manual/auto) for a channel.
+ * This is a destructive action that clears the other mode's data.
+ */
+app.post("/channels/set-storage-mode", async (req, res) => {
+    const { channelId, pubKey, signature, newMode } = req.body;
+
+    if (!channelId || !pubKey || !signature || !newMode) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+    if (newMode !== 'auto' && newMode !== 'manual') {
+        return res.status(400).json({ error: "Invalid mode." });
+    }
+
+    try {
+        // 1. Verify signature
+        const dataToVerify = channelId + newMode; // Client signs this
+        const isAuthentic = await verifySignature(pubKey, signature, dataToVerify);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid signature." });
+        }
+
+        // 2. Find channel and verify owner
+        const channel = await channelsCollection.findOne({ _id: new ObjectId(channelId), ownerPubKey: pubKey });
+        if (!channel) {
+            return res.status(404).json({ error: "Channel not found or you are not the owner." });
+        }
+
+        // 3. Perform the destructive action
+        if (newMode === 'auto') {
+            // Switching TO Auto: Delete all permanent posts
+            const deleteResult = await permanentPostsCollection.deleteMany({ channelId: channel._id });
+            // Update channel document
+            await channelsCollection.updateOne(
+                { _id: channel._id },
+                { $set: { storageMode: "auto", permanentStorageUsed: 0 } }
+            );
+            log(`... Channel ${channel.channelName} switched to AUTO mode. Deleted ${deleteResult.deletedCount} permanent posts.`);
+        
+        } else { // newMode === 'manual'
+            // Switching TO Manual: Delete all auto-cached posts
+            const deleteResult = await autoCachedPostsCollection.deleteMany({ channelId: channel._id });
+            // Update channel document
+            await channelsCollection.updateOne(
+                { _id: channel._id },
+                { $set: { storageMode: "manual", autoCacheQuota: 0 } } // Also reset auto-cache quota
+            );
+            log(`... Channel ${channel.channelName} switched to MANUAL mode. Deleted ${deleteResult.deletedCount} auto-cached posts.`);
+        }
+
+        res.status(200).json({ success: true, newMode: newMode });
+
+    } catch (err) {
+        console.error("Set storage mode error:", err);
+        res.status(500).json({ error: "Server error switching mode." });
+    }
+});
+
+// --- START: Simple Rate Limiting ---
 
 // --- START: Simple Rate Limiting ---
 const rateLimit = new Map();
