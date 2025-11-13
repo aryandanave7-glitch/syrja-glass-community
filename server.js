@@ -1396,7 +1396,7 @@ app.post("/channels/delete", async (req, res) => {
     }
 });
 
-});
+
 
 /**
  * [AUTHENTICATED] Set the storage mode (manual/auto) for a channel.
