@@ -682,16 +682,20 @@ app.post("/channels/post", async (req, res) => {
         res.status(500).json({ error: "Server error posting update." });
     }
 });
-
+// server.js (REPLACING existing function at line 935)
 /**
- * [ANONYMOUS] Get top 10 channels (by follower count)
+ * [ANONYMOUS] Get top channels (by follower count)
  */
 app.get("/channels/discover/top", async (req, res) => {
     try {
+        // --- MODIFIED: Allow client to specify a limit, default to 10 ---
+        const limit = parseInt(req.query.limit) || 10;
+        // --- END MODIFIED ---
+
         const topChannels = await channelsCollection
             .find()
             .sort({ followerCount: -1 }) // Sort by followers
-            .limit(10) // Get top 10
+            .limit(limit) 
             .toArray();
         res.json(topChannels);
     } catch (err) {
