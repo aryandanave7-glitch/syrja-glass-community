@@ -90,17 +90,7 @@ async function connectToMongo() {
 
     // server.js (Added after the "Channels collections" log)
     
-    // --- NEW: Setup for Permanent Channel Posts (Task 1.1) ---
-    permanentPostsCollection = db.collection("permanentPosts");
-    
-    // 1. Index for finding all permanent posts for a channel
-    await permanentPostsCollection.createIndex({ channelId: 1 });
-    // 2. Index for finding the owner (for quota checks)
-    await permanentPostsCollection.createIndex({ ownerPubKey: 1 });
-    
-    console.log("✅ Permanent posts collection and indexes are ready.");
-    // --- END NEW ---
-
+   
     // server.js (Added after the "Permanent posts collection" log)
     
     // --- NEW: Setup for Auto-Cached Channel Posts (Task 1.1) ---
@@ -662,10 +652,10 @@ app.post("/channels/create", async (req, res) => {
             avatar: payload.avatar || null,
             followerCount: 0,
             createdAt: new Date(),
-            permanentStorageUsed: 0, // Start with 0 bytes used
-            permanentStorageQuota: 2 * 1024 * 1024, // Set 2MB quota
-            autoCacheQuota: 0
-            // --- END NEW ---
+            // --- MODIFIED: Use Auto-Cache Quota Only (Task 1.2) ---
+            autoCacheQuota: 0, // Default to 0 (disabled), 1MB max
+            autoCacheStorageUsed: 0 // Track usage for this new quota
+            // --- END MODIFIED ---
         };
         
         await channelsCollection.insertOne(newChannel);
@@ -696,73 +686,105 @@ app.post("/channels/pin-post", async (req, res) => {
         return res.status(400).json({ error: "Missing required fields (postId, pubKey, signature)." });
     }
 
+    // server.js (REPLACING the entire try...catch block for /channels/post)
     try {
-        // 1. Verify the signature (Owner signed the *postId* to confirm pinning)
-        const isAuthentic = await verifySignature(pubKey, signature, postId);
-        if (!isAuthentic) {
-            return res.status(403).json({ error: "Invalid pin signature." });
-        }
-
-        // 2. Find the channel to get its quota and verify ownership
+        // 1. Find the channel by Owner's Public Key
         const channel = await channelsCollection.findOne({ ownerPubKey: pubKey });
         if (!channel) {
-            return res.status(404).json({ error: "Channel not found for this public key." });
+            return res.status(404).json({ error: "Channel not found for this owner." });
         }
         
-        // 3. Find the original 24-hour post
-        const postToPin = await channelUpdatesCollection.findOne({ _id: new ObjectId(postId) });
-        if (!postToPin) {
-            // Check if it's already pinned
-            const alreadyPinned = await permanentPostsCollection.findOne({ _id: new ObjectId(postId) });
-            if (alreadyPinned) return res.status(409).json({ error: "Post is already pinned." });
-            
-            return res.status(404).json({ error: "Original post not found (it may have expired)." });
+        // 2. Verify the channelId from the client matches
+        if (channel._id.toString() !== channelId) {
+             return res.status(403).json({ error: "Channel ID mismatch." });
+        }
+
+        // 3. Verify the signature (owner signed the content)
+        const isAuthentic = await verifySignature(pubKey, signature, content);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid message signature." });
         }
         
-        // 4. Verify the post is from the owner's channel
-        if (postToPin.channelId.toString() !== channel._id.toString()) {
-            return res.status(403).json({ error: "Post does not belong to this channel." });
-        }
+        // 4. Calculate post size
+        const postSize = Buffer.byteLength(content, 'utf8');
 
-        // --- AS PER OUR PLAN: We will add media checks here later ---
-        // For now, we just check the size.
-
-        // 5. Check the quota
-        const postSize = Buffer.byteLength(postToPin.content, 'utf8');
-        const quota = channel.permanentStorageQuota || (2 * 1024 * 1024); // Default 2MB
-        const used = channel.permanentStorageUsed || 0;
-
-        if (used + postSize > quota) {
-            return res.status(413).json({ error: `Quota exceeded. This post is ${formatBytes(postSize)}, you have ${formatBytes(quota - used)} remaining.` });
-        }
-
-        // 6. Copy the post to the permanent collection
-        // We use the *same _id* so we can easily find/merge it
-        const permanentPost = {
-            _id: postToPin._id, // Use the same ID as the original post
-            channelId: postToPin.channelId,
-            ownerPubKey: pubKey, // Add owner pubkey for indexing
-            content: postToPin.content,
-            signature: postToPin.signature,
-            createdAt: postToPin.createdAt
+        // 5. Store the public message in the 24-hour TTL collection
+        const newUpdate = {
+            channelId: new ObjectId(channelId),
+            content,
+            signature,
+            createdAt: new Date(),
+            size: postSize // Store size here too
         };
-        await permanentPostsCollection.insertOne(permanentPost);
+        await channelUpdatesCollection.insertOne(newUpdate);
 
-        // 7. Update the channel's used storage
+        // --- NEW: Rolling Auto-Cache (FIFO) Logic (Task 1.3) ---
+        let finalCacheSize = channel.autoCacheStorageUsed || 0;
+        
+        if (channel.autoCacheQuota && channel.autoCacheQuota > 0) {
+            try {
+                // 6. Copy the post to the auto-cache collection
+                const cachedPost = {
+                    _id: newUpdate._id, // Use the same ID
+                    channelId: newUpdate.channelId,
+                    content: newUpdate.content,
+                    signature: newUpdate.signature,
+                    createdAt: newUpdate.createdAt,
+                    size: postSize
+                };
+                await autoCachedPostsCollection.insertOne(cachedPost);
+                log(`... Auto-Cache: Copied post ${newUpdate._id} to rolling cache.`);
+                
+                // 7. Get all posts and their sizes, oldest first
+                const allCachedPosts = await autoCachedPostsCollection.find(
+                    { channelId: channel._id },
+                    { projection: { createdAt: 1, size: 1 } }
+                ).sort({ createdAt: 1 }).toArray();
+
+                let totalSize = allCachedPosts.reduce((sum, post) => sum + (post.size || 0), 0);
+                const postsToDelete = [];
+
+                if (totalSize > channel.autoCacheQuota) {
+                    log(`... Auto-Cache: Quota exceeded (${formatBytes(totalSize)} / ${formatBytes(channel.autoCacheQuota)}). Pruning...`);
+                    // Keep deleting oldest posts until we are under quota
+                    for (const post of allCachedPosts) {
+                        if (totalSize <= channel.autoCacheQuota) {
+                            break; // We're under quota
+                        }
+                        postsToDelete.push(post._id);
+                        totalSize -= (post.size || 0);
+                    }
+                    
+                    if (postsToDelete.length > 0) {
+                        await autoCachedPostsCollection.deleteMany({ _id: { $in: postsToDelete } });
+                        log(`... Auto-Cache: Pruned ${postsToDelete.length} old posts.`);
+                    }
+                }
+                finalCacheSize = totalSize; // This is the new, correct size
+
+            } catch (cacheErr) {
+                // Log the error but don't fail the whole post
+                console.error("Auto-cache logic failed:", cacheErr.message);
+            }
+        }
+        
+        // 8. Update the channel's storage usage stat
         await channelsCollection.updateOne(
             { _id: channel._id },
-            { $inc: { permanentStorageUsed: postSize } }
+            { $set: { autoCacheStorageUsed: finalCacheSize } }
         );
-        
-        console.log(`📌 Post Pinned: ${postId} for channel ${channel.channelName}. Quota used: ${formatBytes(used + postSize)}`);
-        res.status(201).json({ success: true, message: "Post pinned." });
+        // --- END NEW ---
+
+        console.log(`📢 New post in channel: ${channel.channelName}`);
+        res.status(201).json({ success: true, message: newUpdate });
 
     } catch (err) {
         if (err.code === 11000) { // Duplicate key error
-            return res.status(409).json({ error: "Post is already pinned." });
+             // This can happen if auto-cache insert fails but 24-hour insert worked
+             return res.status(409).json({ error: "Post is already cached." });
         }
-        console.error("Channel pin error:", err);
-        res.status(500).json({ error: "Server error pinning post." });
+        console.error("Channel post error:", err);
+        res.status(500).json({ error: "Server error posting update." });
     }
 });
 
@@ -1031,6 +1053,69 @@ app.post("/channels/post", async (req, res) => {
         res.status(500).json({ error: "Server error posting update." });
     }
 });
+
+// server.js (Added after the /channels/post endpoint)
+
+/**
+ * [AUTHENTICATED] Manually remove a single post from the auto-cache.
+ * Verifies ownership and updates the channel's storage usage.
+ */
+app.post("/channels/remove-from-cache", async (req, res) => {
+    const { postId, pubKey, signature } = req.body;
+    if (!postId || !pubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields (postId, pubKey, signature)." });
+    }
+
+    try {
+        // 1. Verify the signature (Owner signed the *postId* to confirm deletion)
+        const isAuthentic = await verifySignature(pubKey, signature, postId);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid deletion signature." });
+        }
+
+        // 2. Find the channel to verify ownership
+        const channel = await channelsCollection.findOne({ ownerPubKey: pubKey });
+        if (!channel) {
+            return res.status(404).json({ error: "Channel not found for this public key." });
+        }
+        
+        // 3. Find the post in the auto-cache
+        const postToRemove = await autoCachedPostsCollection.findOne({
+            _id: new ObjectId(postId),
+            channelId: channel._id // Ensure it's from their channel
+        });
+
+        if (!postToRemove) {
+            return res.status(404).json({ error: "Post not found in auto-cache." });
+        }
+        
+        // 4. Calculate the size to be freed
+        const postSize = postToRemove.size || Buffer.byteLength(postToRemove.content, 'utf8');
+
+        // 5. Delete the post from the auto-cache collection
+        await autoCachedPostsCollection.deleteOne({ _id: postToRemove._id });
+
+        // 6. Update (decrement) the channel's used storage
+        const newSize = (channel.autoCacheStorageUsed || 0) - postSize;
+        await channelsCollection.updateOne(
+            { _id: channel._id },
+            { $set: { autoCacheStorageUsed: Math.max(0, newSize) } } // Use Math.max to prevent going below 0
+        );
+        
+        console.log(`... Auto-Cache: Manually removed post ${postId} from ${channel.channelName}. Freed: ${formatBytes(postSize)}`);
+        res.status(200).json({ success: true, message: "Post removed from cache." });
+
+    } catch (err) {
+        console.error("Remove from cache error:", err);
+        res.status(500).json({ error: "Server error removing post from cache." });
+    }
+});
+
+/**
+ * [ANONYMOUS] Fetch new messages for followed channels.
+ */
+// ... (your existing /channels/fetch endpoint) ...
+
 // server.js (REPLACING existing function at line 935)
 /**
  * [ANONYMOUS] Get top channels (by follower count)
@@ -1072,9 +1157,10 @@ app.get("/channels/discover/search", async (req, res) => {
 });
 // server.js (REPLACING the /channels/fetch endpoint)
 // server.js (REPLACING the /channels/fetch endpoint)
+// server.js (REPLACING the /channels/fetch endpoint)
 /**
  * [ANONYMOUS] Fetch new messages for followed channels.
- * Fetches 24-hour TTL, permanent-pinned, and auto-cached posts.
+ * Fetches 24-hour TTL posts AND auto-cached posts.
  */
 app.post("/channels/fetch", async (req, res) => {
     const { channels } = req.body; // e.g., [{ id: "...", since: "..." }]
@@ -1083,44 +1169,37 @@ app.post("/channels/fetch", async (req, res) => {
     }
 
     try {
-        // --- 1. Build Queries for ALL THREE Collections ---
+        // --- 1. Build Queries for BOTH Collections ---
         
         // Query 1: Get 24-hour posts created *since* the last check
         const ttlQueries = channels.map(c => ({
             channelId: new ObjectId(c.id),
-            createdAt: { $gt: new Date(c.since) }
+            // Use the 'since' value from the new state object
+            createdAt: { $gt: new Date(c.since) } 
         }));
         
-        // Query 2 & 3: Get ALL permanent and auto-cached posts for these channels
+        // Query 2: Get ALL auto-cached posts for these channels
         const channelIds = channels.map(c => new ObjectId(c.id));
-        const permanentQuery = {
+        const autoCacheQuery = {
             channelId: { $in: channelIds }
         };
 
         // --- 2. Execute Queries in Parallel ---
-        const [ttlMessages, permanentMessages, autoCachedMessages] = await Promise.all([
+        const [ttlMessages, autoCachedMessages] = await Promise.all([
             channelUpdatesCollection.find(ttlQueries.length ? { $or: ttlQueries } : {}).toArray(),
-            permanentPostsCollection.find(permanentQuery).toArray(),
-            autoCachedPostsCollection.find(permanentQuery).toArray() // <-- NEW
+            autoCachedPostsCollection.find(autoCacheQuery).toArray()
         ]);
 
         // --- 3. Merge and De-duplicate ---
-        // We use a Map to ensure posts are not duplicated.
-        // The order here is important.
         const messageMap = new Map();
         
-        // Add 24-hour messages first (least important)
+        // Add 24-hour messages first
         for (const msg of ttlMessages) {
             messageMap.set(msg._id.toString(), msg);
         }
         
-        // Add auto-cached messages (overwrites 24-hour)
+        // Add auto-cached messages (overwriting any 24-hour ones)
         for (const msg of autoCachedMessages) {
-            messageMap.set(msg._id.toString(), msg);
-        }
-        
-        // Add permanent-pinned messages last (overwrites everything)
-        for (const msg of permanentMessages) {
             messageMap.set(msg._id.toString(), msg);
         }
 
