@@ -942,9 +942,14 @@ app.post("/channels/post", async (req, res) => {
 
     try {
         // 1. Find the channel
-        const channel = await channelsCollection.findOne({ _id: new ObjectId(channelId) });
+        const channel = await channelsCollection.findOne({ ownerPubKey: pubKey });
         if (!channel) {
-            return res.status(404).json({ error: "Channel not found." });
+            return res.status(404).json({ error: "Channel not found for this owner." });
+        }
+        
+        // Now, verify the channelId from the client matches the one we found
+        if (channel._id.toString() !== channelId) {
+             return res.status(403).json({ error: "Channel ID mismatch." });
         }
 
         // 2. Verify the poster is the owner
@@ -1235,7 +1240,8 @@ app.get("/channels/meta/:id", async (req, res) => {
                     // --- NEW: Add quota fields ---
                     ownerPubKey: 1, // Need this to check ownership on client
                     permanentStorageUsed: 1,
-                    permanentStorageQuota: 1
+                    permanentStorageQuota: 1,
+                    autoCacheQuota: 1
                     // --- END NEW ---
                 }
             }
