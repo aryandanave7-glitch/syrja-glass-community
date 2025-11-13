@@ -74,6 +74,20 @@ async function connectToMongo() {
     await channelUpdatesCollection.createIndex({ channelId: 1 });
 
     console.log("✅ Channels collections and indexes are ready.");
+
+    // server.js (Added after the "Channels collections" log)
+    
+    // --- NEW: Setup for Permanent Channel Posts (Task 1.1) ---
+    permanentPostsCollection = db.collection("permanentPosts");
+    
+    // 1. Index for finding all permanent posts for a channel
+    await permanentPostsCollection.createIndex({ channelId: 1 });
+    // 2. Index for finding the owner (for quota checks)
+    await permanentPostsCollection.createIndex({ ownerPubKey: 1 });
+    
+    console.log("✅ Permanent posts collection and indexes are ready.");
+    // --- END NEW ---
+      
     // --- END NEW ---
     console.log("✅ Connected successfully to MongoDB Atlas");
   } catch (err) {
@@ -619,7 +633,10 @@ app.post("/channels/create", async (req, res) => {
             description: payload.description || "",
             avatar: payload.avatar || null,
             followerCount: 0,
-            createdAt: new Date()
+            createdAt: new Date(),
+            permanentStorageUsed: 0, // Start with 0 bytes used
+            permanentStorageQuota: 2 * 1024 * 1024 // Set 2MB quota
+            // --- END NEW ---
         };
         
         await channelsCollection.insertOne(newChannel);
@@ -637,6 +654,151 @@ app.post("/channels/create", async (req, res) => {
         res.status(500).json({ error: "Server error creating channel." });
     }
 });
+
+// server.js (Added after the /channels/create endpoint)
+
+/**
+ * [AUTHENTICATED] Pin a post to make it permanent.
+ * Copies a 24-hour post to the permanent collection.
+ */
+app.post("/channels/pin-post", async (req, res) => {
+    const { postId, pubKey, signature } = req.body;
+    if (!postId || !pubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields (postId, pubKey, signature)." });
+    }
+
+    try {
+        // 1. Verify the signature (Owner signed the *postId* to confirm pinning)
+        const isAuthentic = await verifySignature(pubKey, signature, postId);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid pin signature." });
+        }
+
+        // 2. Find the channel to get its quota and verify ownership
+        const channel = await channelsCollection.findOne({ ownerPubKey: pubKey });
+        if (!channel) {
+            return res.status(404).json({ error: "Channel not found for this public key." });
+        }
+        
+        // 3. Find the original 24-hour post
+        const postToPin = await channelUpdatesCollection.findOne({ _id: new ObjectId(postId) });
+        if (!postToPin) {
+            // Check if it's already pinned
+            const alreadyPinned = await permanentPostsCollection.findOne({ _id: new ObjectId(postId) });
+            if (alreadyPinned) return res.status(409).json({ error: "Post is already pinned." });
+            
+            return res.status(404).json({ error: "Original post not found (it may have expired)." });
+        }
+        
+        // 4. Verify the post is from the owner's channel
+        if (postToPin.channelId.toString() !== channel._id.toString()) {
+            return res.status(403).json({ error: "Post does not belong to this channel." });
+        }
+
+        // --- AS PER OUR PLAN: We will add media checks here later ---
+        // For now, we just check the size.
+
+        // 5. Check the quota
+        const postSize = Buffer.byteLength(postToPin.content, 'utf8');
+        const quota = channel.permanentStorageQuota || (2 * 1024 * 1024); // Default 2MB
+        const used = channel.permanentStorageUsed || 0;
+
+        if (used + postSize > quota) {
+            return res.status(413).json({ error: `Quota exceeded. This post is ${formatBytes(postSize)}, you have ${formatBytes(quota - used)} remaining.` });
+        }
+
+        // 6. Copy the post to the permanent collection
+        // We use the *same _id* so we can easily find/merge it
+        const permanentPost = {
+            _id: postToPin._id, // Use the same ID as the original post
+            channelId: postToPin.channelId,
+            ownerPubKey: pubKey, // Add owner pubkey for indexing
+            content: postToPin.content,
+            signature: postToPin.signature,
+            createdAt: postToPin.createdAt
+        };
+        await permanentPostsCollection.insertOne(permanentPost);
+
+        // 7. Update the channel's used storage
+        await channelsCollection.updateOne(
+            { _id: channel._id },
+            { $inc: { permanentStorageUsed: postSize } }
+        );
+        
+        console.log(`📌 Post Pinned: ${postId} for channel ${channel.channelName}. Quota used: ${formatBytes(used + postSize)}`);
+        res.status(201).json({ success: true, message: "Post pinned." });
+
+    } catch (err) {
+        if (err.code === 11000) { // Duplicate key error
+            return res.status(409).json({ error: "Post is already pinned." });
+        }
+        console.error("Channel pin error:", err);
+        res.status(500).json({ error: "Server error pinning post." });
+    }
+});
+
+// server.js (Added after the /channels/pin-post endpoint)
+
+/**
+ * [AUTHENTICATED] Unpin a post to remove it from permanent storage.
+ * Deletes a post from the permanent collection and frees up quota.
+ */
+app.post("/channels/unpin-post", async (req, res) => {
+    const { postId, pubKey, signature } = req.body;
+    if (!postId || !pubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields (postId, pubKey, signature)." });
+    }
+
+    try {
+        // 1. Verify the signature (Owner signed the *postId* to confirm unpinning)
+        const isAuthentic = await verifySignature(pubKey, signature, postId);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid unpin signature." });
+        }
+
+        // 2. Find the channel to verify ownership
+        const channel = await channelsCollection.findOne({ ownerPubKey: pubKey });
+        if (!channel) {
+            return res.status(404).json({ error: "Channel not found for this public key." });
+        }
+
+        // 3. Find the permanent post to be deleted
+        const postToUnpin = await permanentPostsCollection.findOne({
+            _id: new ObjectId(postId),
+            ownerPubKey: pubKey // Ensure it's their post
+        });
+
+        if (!postToUnpin) {
+            return res.status(404).json({ error: "Permanent post not found (or not owned by you)." });
+        }
+        
+        // 4. Calculate the size to be freed
+        const postSize = Buffer.byteLength(postToUnpin.content, 'utf8');
+
+        // 5. Delete the post from the permanent collection
+        await permanentPostsCollection.deleteOne({ _id: postToUnpin._id });
+
+        // 6. Update (decrement) the channel's used storage
+        // We use $max to ensure the quota never drops below 0
+        await channelsCollection.updateOne(
+            { _id: channel._id },
+            { $inc: { permanentStorageUsed: -postSize } }
+        );
+        // Follow-up query to fix any potential negative numbers (e.g., if quota was reset)
+        await channelsCollection.updateOne(
+            { _id: channel._id, permanentStorageUsed: { $lt: 0 } },
+            { $set: { permanentStorageUsed: 0 } }
+        );
+        
+        console.log(`... Post Unpinned: ${postId} from channel ${channel.channelName}. Freed: ${formatBytes(postSize)}`);
+        res.status(200).json({ success: true, message: "Post unpinned." });
+
+    } catch (err) {
+        console.error("Channel unpin error:", err);
+        res.status(500).json({ error: "Server error unpinning post." });
+    }
+});
+
 /**
  * [AUTHENTICATED] Post a new update to a channel.
  */
@@ -721,10 +883,10 @@ app.get("/channels/discover/search", async (req, res) => {
         res.status(500).json({ error: "Server error." });
     }
 });
-
+// server.js (REPLACING the /channels/fetch endpoint)
 /**
  * [ANONYMOUS] Fetch new messages for followed channels.
- * This is the main "pull" endpoint for followers.
+ * Fetches BOTH 24-hour TTL posts AND all permanent posts.
  */
 app.post("/channels/fetch", async (req, res) => {
     const { channels } = req.body; // e.g., [{ id: "...", since: "..." }]
@@ -733,17 +895,47 @@ app.post("/channels/fetch", async (req, res) => {
     }
 
     try {
-        // Build a query for each channel
-        const queries = channels.map(c => ({
+        // --- 1. Build Queries for BOTH Collections ---
+        
+        // Query 1: Get 24-hour posts created *since* the last check
+        const ttlQueries = channels.map(c => ({
             channelId: new ObjectId(c.id),
             createdAt: { $gt: new Date(c.since) }
         }));
+        
+        // Query 2: Get ALL permanent posts for these channels
+        const channelIds = channels.map(c => new ObjectId(c.id));
+        const permanentQuery = {
+            channelId: { $in: channelIds }
+        };
 
-        // Find all messages matching any of the queries
-        const allNewMessages = await channelUpdatesCollection
-            .find({ $or: queries })
-            .sort({ createdAt: 1 }) // Send oldest-to-newest
-            .toArray();
+        // --- 2. Execute Queries in Parallel ---
+        const [ttlMessages, permanentMessages] = await Promise.all([
+            channelUpdatesCollection.find(ttlQueries.length ? { $or: ttlQueries } : {}).toArray(),
+            permanentPostsCollection.find(permanentQuery).toArray()
+        ]);
+
+        // --- 3. Merge and De-duplicate ---
+        // We use a Map to ensure permanent posts (which have the same _id
+        // as a 24-hour post) and any other duplicates are handled.
+        const messageMap = new Map();
+        
+        // Add all 24-hour messages first
+        for (const msg of ttlMessages) {
+            messageMap.set(msg._id.toString(), msg);
+        }
+        
+        // Add all permanent messages (overwriting any 24-hour ones)
+        // This ensures the permanent version is always the one sent
+        for (const msg of permanentMessages) {
+            messageMap.set(msg._id.toString(), msg);
+        }
+
+        // Convert the map back to an array
+        const allNewMessages = Array.from(messageMap.values());
+        
+        // Sort the final merged list by creation date
+        allNewMessages.sort((a, b) => a.createdAt - b.createdAt);
 
         res.json(allNewMessages);
 
