@@ -941,6 +941,53 @@ app.post("/channels/update-meta", async (req, res) => {
     }
 });
 
+// server.js (Added after the /channels/update-meta endpoint)
+
+/**
+ * [AUTHENTICATED] Delete an entire channel.
+ * Verifies ownership, then deletes the channel and all its posts.
+ */
+app.post("/channels/delete", async (req, res) => {
+    // 1. Get the signed payload
+    const { channelId, pubKey, signature } = req.body;
+    if (!channelId || !pubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields (channelId, pubKey, signature)." });
+    }
+
+    try {
+        // 2. Find the channel to verify the owner
+        const channel = await channelsCollection.findOne({ _id: new ObjectId(channelId) });
+        if (!channel) {
+            return res.status(404).json({ error: "Channel not found." });
+        }
+
+        // 3. Verify the poster is the owner
+        if (channel.ownerPubKey !== pubKey) {
+            return res.status(403).json({ error: "You are not the owner of this channel." });
+        }
+
+        // 4. Verify the signature (owner signed the *channelId* to confirm deletion)
+        const isAuthentic = await verifySignature(pubKey, signature, channelId);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid deletion signature." });
+        }
+
+        // 5. Delete the channel document
+        await channelsCollection.deleteOne({ _id: new ObjectId(channelId) });
+        
+        // 6. Delete all posts associated with that channel
+        const deleteResult = await channelUpdatesCollection.deleteMany({ channelId: new ObjectId(channelId) });
+
+        console.log(`🗑️ CHANNEL DELETED: ${channel.channelName} by ${pubKey.slice(0, 10)}...`);
+        console.log(`   - Deleted ${deleteResult.deletedCount} associated posts.`);
+        res.status(200).json({ success: true, message: "Channel and all posts deleted." });
+
+    } catch (err) {
+        console.error("Channel deletion error:", err);
+        res.status(500).json({ error: "Server error deleting channel." });
+    }
+});
+
 // --- START: Simple Rate Limiting ---
 const rateLimit = new Map();
 const LIMIT = 20; // Max 20 requests
