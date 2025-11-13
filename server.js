@@ -3,7 +3,6 @@ const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const crypto = require('crypto');
-const rateLimit = require("express-rate-limit");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb"); // Import MongoDB client & ObjectId
 
 
@@ -184,61 +183,6 @@ async function verifySignature(pubKeyB64, signatureB64, data) {
 // Simple word lists for more memorable IDs
 const ADJECTIVES = ["alpha", "beta", "gamma", "delta", "zeta", "nova", "comet", "solar", "lunar", "star"];
 const NOUNS = ["fox", "wolf", "hawk", "lion", "tiger", "bear", "crane", "iris", "rose", "maple"];
-
-// server.js (Added after the verifySignature function)
-
-// --- NEW: Custom Key Generator for Authenticated Requests ---
-// Finds the owner's pubKey in the request body for tracking.
-const customKeyGenerator = (req, res) => {
-    try {
-        // Priority 1: Check payloadString (used by POST /channels/post, /create, etc.)
-        if (req.body.payloadString) {
-            const payload = JSON.parse(req.body.payloadString);
-            return payload.pubKey || req.ip;
-        }
-        // Priority 2: Check standard pubKey field (used by DELETE /delete-id)
-        if (req.body.pubKey) {
-            return req.body.pubKey;
-        }
-        // Fallback to IP address
-        return req.ip;
-    } catch (e) {
-        return req.ip;
-    }
-};
-
-// --- NEW: Rate Limiters (Task 4.1) ---
-
-// 1. High-Volume Posting Limiter (10 posts per minute)
-const postLimiter = rateLimit({
-    windowMs: 60 * 1000, // 1 minute
-    max: 10,             // Max 10 requests per key
-    keyGenerator: customKeyGenerator,
-    handler: (req, res) => {
-        res.status(429).json({ error: "Too many requests. Please wait 60 seconds." });
-    }
-});
-
-// 2. Low-Volume Settings Limiter (5 requests per hour)
-const settingsLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, // 1 hour
-    max: 5,                  // Max 5 requests per key
-    keyGenerator: customKeyGenerator,
-    handler: (req, res) => {
-        res.status(429).json({ error: "Settings limit exceeded. Try again in an hour." });
-    }
-});
-
-// 3. Ultra-Low Harmful Actions Limiter (1 request per 24 hours)
-const deleteLimiter = rateLimit({
-    windowMs: 24 * 60 * 60 * 1000, // 24 hours
-    max: 1,                        // Max 1 request per key
-    keyGenerator: customKeyGenerator,
-    handler: (req, res) => {
-        res.status(429).json({ error: "Deletion limit exceeded. You can only delete once every 24 hours." });
-    }
-});
-// --- END NEW ---
 
 const app = express();
 
@@ -676,7 +620,7 @@ app.delete("/delete-relayed-message/:messageId", async (req, res) => {
  */
 // In server.js
 
-app.post("/channels/create", postLimiter, async (req, res) => {
+app.post("/channels/create", async (req, res) => {
     // 1. Receive the payloadString and signature
     const { payloadString, signature } = req.body;
     
@@ -750,7 +694,7 @@ app.post("/channels/create", postLimiter, async (req, res) => {
  * [AUTHENTICATED] Pin a post to make it permanent.
  * Copies a 24-hour post to the permanent collection.
  */
-app.post("/channels/pin-post" , postLimiter, async (req, res) => {
+app.post("/channels/pin-post", async (req, res) => {
     const { postId, pubKey, signature } = req.body;
     if (!postId || !pubKey || !signature) {
         return res.status(400).json({ error: "Missing required fields (postId, pubKey, signature)." });
@@ -840,7 +784,7 @@ app.post("/channels/pin-post" , postLimiter, async (req, res) => {
  * [AUTHENTICATED] Unpin a post to remove it from permanent storage.
  * Deletes a post from the permanent collection and frees up quota.
  */
-app.post("/channels/unpin-post",postLimiter, async (req, res) => {
+app.post("/channels/unpin-post", async (req, res) => {
     const { postId, pubKey, signature } = req.body;
     if (!postId || !pubKey || !signature) {
         return res.status(400).json({ error: "Missing required fields (postId, pubKey, signature)." });
@@ -952,7 +896,7 @@ app.get("/channels/permanent-posts/:pubKey", async (req, res) => {
 /**
  * [AUTHENTICATED] Set the auto-cache quota for a channel.
  */
-app.post("/channels/set-auto-cache", settingsLimiter, async (req, res) => {
+app.post("/channels/set-auto-cache", async (req, res) => {
     // 1. Get the signed payload
     const { payloadString, signature } = req.body;
     if (!payloadString || !signature) {
@@ -1010,7 +954,7 @@ app.post("/channels/set-auto-cache", settingsLimiter, async (req, res) => {
 /**
  * [AUTHENTICATED] Post a new update to a channel.
  */
-app.post("/channels/post", postLimiter, async (req, res) => {
+app.post("/channels/post", async (req, res) => {
     const { channelId, content, pubKey, signature } = req.body;
     if (!channelId || !content || !pubKey || !signature) {
         return res.status(400).json({ error: "Missing required fields." });
@@ -1342,7 +1286,7 @@ app.get("/channels/meta/:id", async (req, res) => {
  * [AUTHENTICATED] Update a channel's metadata (avatar, description).
  * Verifies ownership before updating.
  */
-app.post("/channels/update-meta",settingsLimiter, async (req, res) => {
+app.post("/channels/update-meta", async (req, res) => {
     // 1. Get the signed payload
     const { payloadString, signature } = req.body;
     if (!payloadString || !signature) {
@@ -1414,7 +1358,7 @@ app.post("/channels/update-meta",settingsLimiter, async (req, res) => {
  * [AUTHENTICATED] Delete an entire channel.
  * Verifies ownership, then deletes the channel and all its posts.
  */
-app.post("/channels/delete",deleteLimiter, async (req, res) => {
+app.post("/channels/delete", async (req, res) => {
     // 1. Get the signed payload
     const { channelId, pubKey, signature } = req.body;
     if (!channelId || !pubKey || !signature) {
