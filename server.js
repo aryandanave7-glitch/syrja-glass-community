@@ -799,6 +799,49 @@ app.post("/channels/unpin-post", async (req, res) => {
     }
 });
 
+// server.js (Added after the /channels/unpin-post endpoint)
+
+/**
+ * [AUTHENTICATED] Get all permanent posts for the owner's channel.
+ * Used for the "Manage Storage" panel.
+ */
+app.get("/channels/permanent-posts/:pubKey", async (req, res) => {
+    const { pubKey } = req.params;
+    
+    // We use a header for the signature to avoid query string issues
+    const signature = req.headers['x-syrja-sig'];
+    const timestamp = req.headers['x-syrja-ts'];
+
+    if (!pubKey || !signature || !timestamp) {
+        return res.status(400).json({ error: "Missing required fields (pubKey, signature, timestamp)." });
+    }
+
+    // Anti-replay: Check if timestamp is recent (e.g., within 30 seconds)
+    if (Math.abs(Date.now() - parseInt(timestamp, 10)) > 30000) {
+        return res.status(408).json({ error: "Request timestamp is too old." });
+    }
+
+    try {
+        // 1. Verify the signature (Owner signed their own pubKey + timestamp)
+        const dataToVerify = `${pubKey}${timestamp}`;
+        const isAuthentic = await verifySignature(pubKey, signature, dataToVerify);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid signature." });
+        }
+
+        // 2. Find all permanent posts for this owner
+        const posts = await permanentPostsCollection.find({
+            ownerPubKey: pubKey
+        }).sort({ createdAt: -1 }).toArray(); // Sort newest first
+
+        res.status(200).json(posts);
+
+    } catch (err) {
+        console.error("Get permanent posts error:", err);
+        res.status(500).json({ error: "Server error getting posts." });
+    }
+});
+
 /**
  * [AUTHENTICATED] Post a new update to a channel.
  */
@@ -1044,7 +1087,12 @@ app.get("/channels/meta/:id", async (req, res) => {
                     channelName: 1,
                     description: 1,
                     avatar: 1,
-                    followerCount: 1
+                    followerCount: 1,
+                    // --- NEW: Add quota fields ---
+                    ownerPubKey: 1, // Need this to check ownership on client
+                    permanentStorageUsed: 1,
+                    permanentStorageQuota: 1
+                    // --- END NEW ---
                 }
             }
         );
