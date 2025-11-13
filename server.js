@@ -6,6 +6,9 @@ const crypto = require('crypto');
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb"); // Import MongoDB client & ObjectId
 
 
+function log(...args) {
+    console.log('[Syrja-Server-Log]', ...args);
+}
 // --- NEW: Utility Function for Logging ---
 function formatBytes(bytes, decimals = 2) {
     if (bytes === 0) return '0 Bytes';
