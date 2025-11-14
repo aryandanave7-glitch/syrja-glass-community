@@ -1644,12 +1644,11 @@ const socketSubscriptions = {};
 function normKey(k){ return (typeof k === 'string') ? k.replace(/\s+/g,'') : k; }
 
 io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
-
+  
   // Handle client registration
   socket.on("register", (pubKey) => {
     if (isRateLimited(socket)) {
-      console.log(`⚠️ Rate limit exceeded for registration by ${socket.handshake.address}`);
+      
       return;
     }
     if (!pubKey) return;
@@ -1766,7 +1765,7 @@ io.on("connection", (socket) => {
   // Handle direct connection requests
   socket.on("request-connection", async ({ to, from }) => {
     if (isRateLimited(socket)) {
-      console.log(`⚠️ Rate limit exceeded for request-connection by ${socket.handshake.address}`);
+      
       return;
     }
 
@@ -1865,7 +1864,7 @@ socket.on("signal", ({ room, payload }) => {
 });
 
   socket.on("disconnect", () => {
-    console.log("Client disconnected:", socket.id);
+    
     const pubKey = socket.data.pubKey;
 
     if (pubKey) {
