@@ -1399,7 +1399,138 @@ app.post("/channels/delete", async (req, res) => {
     }
 });
 
+// --- NEW: "My Data" Privacy Endpoints ---
 
+/**
+ * [AUTHENTICATED] Fetches all data associated with a user's public key.
+ */
+app.get("/my-data/:pubKey", async (req, res) => {
+    const { pubKey } = req.params;
+    const signature = req.headers['x-syrja-sig'];
+    const timestamp = req.headers['x-syrja-ts'];
+
+    if (!pubKey || !signature || !timestamp) {
+        return res.status(400).json({ error: "Missing required fields (pubKey, signature, timestamp)." });
+    }
+    // Anti-replay: Check if timestamp is recent (e.g., within 30 seconds)
+    if (Math.abs(Date.now() - parseInt(timestamp, 10)) > 30000) {
+        return res.status(408).json({ error: "Request timestamp is too old." });
+    }
+
+    try {
+        // Verify the signature (Owner signed their own pubKey + timestamp)
+        const dataToVerify = `${pubKey}${timestamp}`;
+        const isAuthentic = await verifySignature(pubKey, signature, dataToVerify);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid signature." });
+        }
+
+        log(`... Fetching all data for ${pubKey.slice(0, 10)}...`);
+
+        // 1. Get all data in parallel
+        const [
+            profile,
+            offlineMessages,
+            channel,
+        ] = await Promise.all([
+            idsCollection.findOne({ pubKey: pubKey }),
+            offlineMessagesCollection.find({ senderPubKey: pubKey }).toArray(),
+            channelsCollection.findOne({ ownerPubKey: pubKey }),
+        ]);
+
+        let permanentPosts = [];
+        let autoCachedPosts = [];
+        let channelPosts24h = [];
+
+        if (channel) {
+            // 2. If channel exists, get its posts
+            const [perm, auto, ttl] = await Promise.all([
+                permanentPostsCollection.find({ channelId: channel._id }).toArray(),
+                autoCachedPostsCollection.find({ channelId: channel._id }).toArray(),
+                channelUpdatesCollection.find({ channelId: channel._id }).toArray(),
+            ]);
+            permanentPosts = perm;
+            autoCachedPosts = auto;
+            channelPosts24h = ttl;
+        }
+
+        // 3. Bundle the data
+        const allData = {
+            profile: profile || null,
+            offlineMessages: offlineMessages,
+            channel: channel || null,
+            channelPosts: {
+                permanent: permanentPosts,
+                autoCached: autoCachedPosts,
+                ttl24Hour: channelPosts24h,
+            }
+        };
+
+        res.status(200).json(allData);
+
+    } catch (err) {
+        console.error("Get /my-data error:", err);
+        res.status(500).json({ error: "Server error fetching data." });
+    }
+});
+
+/**
+ * [AUTHENTICATED] Deletes all data associated with a user's public key.
+ */
+app.delete("/my-data/:pubKey", async (req, res) => {
+    const { pubKey } = req.params;
+    const signature = req.headers['x-syrja-sig'];
+    const timestamp = req.headers['x-syrja-ts'];
+
+    if (!pubKey || !signature || !timestamp) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+    if (Math.abs(Date.now() - parseInt(timestamp, 10)) > 30000) {
+        return res.status(408).json({ error: "Request timestamp is too old." });
+    }
+
+    try {
+        const dataToVerify = `${pubKey}${timestamp}`;
+        const isAuthentic = await verifySignature(pubKey, signature, dataToVerify);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid signature." });
+        }
+
+        log(`... DELETING all data for ${pubKey.slice(0, 10)}...`);
+
+        // 1. Find the user's channel first to get the ID
+        const channel = await channelsCollection.findOne({ ownerPubKey: pubKey }, { projection: { _id: 1 } });
+
+        // 2. Start all deletions in parallel
+        const deletePromises = [
+            idsCollection.deleteOne({ pubKey: pubKey }),
+            offlineMessagesCollection.deleteMany({ senderPubKey: pubKey }),
+            channelsCollection.deleteOne({ ownerPubKey: pubKey }),
+        ];
+
+        if (channel) {
+            log(`... Deleting associated channel posts for channel ${channel._id}...`);
+            deletePromises.push(
+                permanentPostsCollection.deleteMany({ channelId: channel._id })
+            );
+            deletePromises.push(
+                autoCachedPostsCollection.deleteMany({ channelId: channel._id })
+            );
+            deletePromises.push(
+                channelUpdatesCollection.deleteMany({ channelId: channel._id })
+            );
+        }
+
+        await Promise.all(deletePromises);
+
+        log(`... All data for ${pubKey.slice(0, 10)} has been permanently deleted.`);
+        res.status(200).json({ success: true, message: "All user data deleted." });
+
+    } catch (err) {
+        console.error("Delete /my-data error:", err);
+        res.status(500).json({ error: "Server error deleting data." });
+    }
+});
 
 /**
  * [AUTHENTICATED] Set the storage mode (manual/auto) for a channel.
