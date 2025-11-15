@@ -1767,11 +1767,15 @@ app.post("/group/update-meta", async (req, res) => {
 /**
  * [AUTHENTICATED] Add a member to a group.
  * Only an admin can do this.
+ *//**
+ * [AUTHENTICATED] Add one or more members to a group.
+ * Only an admin can do this.
  */
 app.post("/group/add-member", async (req, res) => {
-    const { groupID, pubKey, signature, memberToAddPubKey } = req.body;
-    if (!groupID || !pubKey || !signature || !memberToAddPubKey) {
-        return res.status(400).json({ error: "Missing required fields." });
+    // --- UPDATED: Expect an array ---
+    const { groupID, pubKey, signature, membersToAdd } = req.body;
+    if (!groupID || !pubKey || !signature || !Array.isArray(membersToAdd) || membersToAdd.length === 0) {
+        return res.status(400).json({ error: "Missing required fields (groupID, pubKey, signature, membersToAdd:[])." });
     }
 
     try {
@@ -1783,21 +1787,22 @@ app.post("/group/add-member", async (req, res) => {
             return res.status(403).json({ error: "You are not an admin of this group." });
         }
 
-        // 2. Verify signature (admin signed groupID + memberToAddPubKey)
-        const dataToVerify = `${groupID}${memberToAddPubKey}`;
+        // 2. Verify signature (admin signed groupID + all new member PubKeys sorted)
+        const membersString = [...membersToAdd].sort().join(',');
+        const dataToVerify = `${groupID}${membersString}`;
         const isAuthentic = await verifySignature(pubKey, signature, dataToVerify);
         if (!isAuthentic) {
             return res.status(403).json({ error: "Invalid signature." });
         }
 
-        // 3. Add the member to the 'members' array
-        // $addToSet prevents duplicates
+        // 3. Add all new members to the 'members' array
+        // $addToSet with $each adds all items from the array that aren't already present
         const updateResult = await groupsCollection.updateOne(
             { _id: group._id },
-            { $addToSet: { members: memberToAddPubKey } }
+            { $addToSet: { members: { $each: membersToAdd } } }
         );
 
-        log(`[Group] Admin ${pubKey.slice(0,10)} added ${memberToAddPubKey.slice(0,10)} to group ${group.groupName}`);
+        log(`[Group] Admin ${pubKey.slice(0,10)} added ${membersToAdd.length} members to group ${group.groupName}`);
 
         // 4. Notify all other members of the roster change
         const updatedGroup = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
