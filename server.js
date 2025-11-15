@@ -1875,10 +1875,11 @@ app.post("/group/remove-member", async (req, res) => {
         const membersToNotify = updatedGroup.members.filter(m => m !== pubKey); 
 
         membersToNotify.forEach(memberPubKey => {
-            const targetSocketId = userSockets[memberPubKey];
+            const normalizedKey = normKey(memberPubKey); // <-- FIX: Normalize the key
+            const targetSocketId = userSockets[normalizedKey]; // <-- FIX: Use normalized key
             if (targetSocketId) {
                 io.to(targetSocketId).emit("group_roster_changed", { 
-                    groupID: groupID,
+                    groupID: groupID, 
                     groupName: updatedGroup.groupName
                 });
             }
@@ -1946,7 +1947,8 @@ app.post("/group/leave", async (req, res) => {
         // 5. Notify all remaining members
         const updatedGroup = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
         updatedGroup.members.forEach(memberPubKey => { // Notify *all* remaining
-            const targetSocketId = userSockets[memberPubKey];
+            const normalizedKey = normKey(memberPubKey); // <-- FIX: Normalize the key
+            const targetSocketId = userSockets[normalizedKey]; // <-- FIX: Use normalized key
             if (targetSocketId) {
                 io.to(targetSocketId).emit("group_roster_changed", { 
                     groupID: groupID,
