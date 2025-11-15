@@ -1705,6 +1705,247 @@ app.post("/group/meta", async (req, res) => {
         res.status(500).json({ error: "Server error fetching group data." });
     }
 });
+/**
+ * [AUTHENTICATED] Update a group's metadata (name, avatar).
+ * Only an admin can do this.
+ */
+app.post("/group/update-meta", async (req, res) => {
+    const { groupID, pubKey, signature, newName, newAvatar } = req.body;
+    if (!groupID || !pubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+    if (newName === undefined && newAvatar === undefined) {
+        return res.status(400).json({ error: "Must provide newName or newAvatar." });
+    }
+
+    try {
+        // 1. Find group
+        const group = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
+        if (!group) return res.status(404).json({ error: "Group not found." });
+
+        // 2. Verify user is an admin
+        if (!group.admins.includes(pubKey)) {
+            return res.status(403).json({ error: "You are not an admin of this group." });
+        }
+
+        // 3. Verify signature (admin signed the groupID + newName)
+        // Note: We don't sign the avatar as it's too large.
+        const dataToVerify = `${groupID}${newName || group.groupName}`;
+        const isAuthentic = await verifySignature(pubKey, signature, dataToVerify);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid signature." });
+        }
+
+        // 4. Build update
+        const fieldsToUpdate = {};
+        if (newName !== undefined) fieldsToUpdate.groupName = newName;
+        if (newAvatar !== undefined) fieldsToUpdate.groupAvatar = newAvatar; // Can be null
+
+        // 5. Perform update
+        await groupsCollection.updateOne({ _id: group._id }, { $set: fieldsToUpdate });
+
+        log(`[GroupMeta] Admin ${pubKey.slice(0,10)} updated group ${group.groupName}`);
+        res.status(200).json({ success: true, ...fieldsToUpdate });
+
+    } catch (err) {
+        console.error("Group meta update error:", err);
+        res.status(500).json({ error: "Server error updating group." });
+    }
+});
+
+/**
+ * [AUTHENTICATED] Add a member to a group.
+ * Only an admin can do this.
+ */
+app.post("/group/add-member", async (req, res) => {
+    const { groupID, pubKey, signature, memberToAddPubKey } = req.body;
+    if (!groupID || !pubKey || !signature || !memberToAddPubKey) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    try {
+        const group = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
+        if (!group) return res.status(404).json({ error: "Group not found." });
+
+        // 1. Verify user is an admin
+        if (!group.admins.includes(pubKey)) {
+            return res.status(403).json({ error: "You are not an admin of this group." });
+        }
+
+        // 2. Verify signature (admin signed groupID + memberToAddPubKey)
+        const dataToVerify = `${groupID}${memberToAddPubKey}`;
+        const isAuthentic = await verifySignature(pubKey, signature, dataToVerify);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid signature." });
+        }
+
+        // 3. Add the member to the 'members' array
+        // $addToSet prevents duplicates
+        const updateResult = await groupsCollection.updateOne(
+            { _id: group._id },
+            { $addToSet: { members: memberToAddPubKey } }
+        );
+
+        log(`[Group] Admin ${pubKey.slice(0,10)} added ${memberToAddPubKey.slice(0,10)} to group ${group.groupName}`);
+
+        // 4. Notify all other members of the roster change
+        const updatedGroup = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
+        const membersToNotify = updatedGroup.members.filter(m => m !== pubKey); // Notify everyone else
+
+        membersToNotify.forEach(memberPubKey => {
+            const targetSocketId = userSockets[memberPubKey];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("group_roster_changed", { 
+                    groupID: groupID, 
+                    groupName: updatedGroup.groupName
+                });
+            }
+        });
+
+        res.status(200).json(updatedGroup); // Return the full new group doc
+
+    } catch (err) {
+        console.error("Group add member error:", err);
+        res.status(500).json({ error: "Server error adding member." });
+    }
+});
+
+/**
+ * [AUTHENTICATED] Remove a member from a group.
+ * Only an admin can do this.
+ */
+app.post("/group/remove-member", async (req, res) => {
+    const { groupID, pubKey, signature, memberToRemovePubKey } = req.body;
+    if (!groupID || !pubKey || !signature || !memberToRemovePubKey) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    try {
+        const group = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
+        if (!group) return res.status(404).json({ error: "Group not found." });
+
+        // 1. Verify user is an admin
+        if (!group.admins.includes(pubKey)) {
+            return res.status(403).json({ error: "You are not an admin of this group." });
+        }
+
+        // 2. Prevent admin from removing the last owner/admin
+        if (group.owner === memberToRemovePubKey && group.admins.length === 1) {
+            return res.status(403).json({ error: "Cannot remove the last admin/owner." });
+        }
+
+        // 3. Verify signature (admin signed groupID + memberToRemovePubKey)
+        const dataToVerify = `${groupID}${memberToRemovePubKey}`;
+        const isAuthentic = await verifySignature(pubKey, signature, dataToVerify);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid signature." });
+        }
+
+        // 4. Remove the member
+        const updateResult = await groupsCollection.updateOne(
+            { _id: group._id },
+            { 
+                $pull: { 
+                    members: memberToRemovePubKey,
+                    admins: memberToRemovePubKey // Also remove from admin list if they were one
+                } 
+            }
+        );
+
+        log(`[Group] Admin ${pubKey.slice(0,10)} removed ${memberToRemovePubKey.slice(0,10)} from group ${group.groupName}`);
+
+        // 5. Notify all remaining members
+        const updatedGroup = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
+        const membersToNotify = updatedGroup.members.filter(m => m !== pubKey); 
+
+        membersToNotify.forEach(memberPubKey => {
+            const targetSocketId = userSockets[memberPubKey];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("group_roster_changed", { 
+                    groupID: groupID,
+                    groupName: updatedGroup.groupName
+                });
+            }
+        });
+
+        // 6. Also notify the person who was removed
+        const removedSocketId = userSockets[memberToRemovePubKey];
+        if (removedSocketId) {
+             io.to(removedSocketId).emit("group_removed_from", { 
+                groupID: groupID,
+                groupName: updatedGroup.groupName
+            });
+        }
+
+        res.status(200).json(updatedGroup); // Return the full new group doc
+
+    } catch (err) {
+        console.error("Group remove member error:", err);
+        res.status(500).json({ error: "Server error removing member." });
+    }
+});
+
+/**
+ * [AUTHENTICATED] A member leaves a group.
+ */
+app.post("/group/leave", async (req, res) => {
+    const { groupID, pubKey, signature } = req.body;
+    if (!groupID || !pubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    try {
+        const group = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
+        if (!group) return res.status(404).json({ error: "Group not found." });
+
+        // 1. Verify user is a member
+        if (!group.members.includes(pubKey)) {
+            return res.status(403).json({ error: "You are not a member of this group." });
+        }
+
+        // 2. Prevent owner from leaving if they are the last admin
+        if (group.owner === pubKey && group.admins.length === 1) {
+            return res.status(403).json({ error: "You are the last admin. You must delete the group instead." });
+        }
+
+        // 3. Verify signature (user signed the groupID)
+        const isAuthentic = await verifySignature(pubKey, signature, groupID);
+        if (!isAuthentic) {
+            return res.status(403).json({ error: "Invalid signature." });
+        }
+
+        // 4. Remove the member
+        await groupsCollection.updateOne(
+            { _id: group._id },
+            { 
+                $pull: { 
+                    members: pubKey,
+                    admins: pubKey
+                } 
+            }
+        );
+
+        log(`[Group] Member ${pubKey.slice(0,10)} left group ${group.groupName}`);
+
+        // 5. Notify all remaining members
+        const updatedGroup = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
+        updatedGroup.members.forEach(memberPubKey => { // Notify *all* remaining
+            const targetSocketId = userSockets[memberPubKey];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("group_roster_changed", { 
+                    groupID: groupID,
+                    groupName: updatedGroup.groupName
+                });
+            }
+        });
+
+        res.status(200).json({ success: true });
+
+    } catch (err) {
+        console.error("Group leave error:", err);
+        res.status(500).json({ error: "Server error leaving group." });
+    }
+});
 // --- START: Simple Rate Limiting ---
 
 // --- START: Simple Rate Limiting ---
