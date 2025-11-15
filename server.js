@@ -44,6 +44,8 @@ const mongoClient = new MongoClient(mongoUri, {
 let db; // To hold the database connection
 let idsCollection; // To hold the collection reference
 let offlineMessagesCollection;
+let groupsCollection; // For group metadata
+let groupOfflineMessagesCollection; // For offline group messages
 let channelsCollection; // For channel info
 let channelUpdatesCollection; // For channel messages
 
@@ -118,6 +120,23 @@ async function connectToMongo() {
     await autoCachedPostsCollection.createIndex({ "createdAt": 1 }, { expireAfterSeconds: 86400 });
 
     console.log("✅ Auto-cached posts collection and indexes are ready.");
+
+    // --- NEW: Setup for Groups (Phase 1) ---
+    groupsCollection = db.collection("groups");
+    groupOfflineMessagesCollection = db.collection("groupOfflineMessages");
+
+    // 1. Index for finding groups by member
+    await groupsCollection.createIndex({ "members": 1 });
+
+    // 2. Index for finding offline group messages for a specific user
+    await groupOfflineMessagesCollection.createIndex({ recipientPubKey: 1 });
+    // 3. Index for finding messages for a specific group (for cleanup, etc.)
+    await groupOfflineMessagesCollection.createIndex({ groupID: 1 });
+    // 4. TTL index for group messages (e.g., 14 days, same as 1-to-1)
+    await groupOfflineMessagesCollection.createIndex({ "expireAt": 1 }, { expireAfterSeconds: 0 });
+
+    console.log("✅ Groups collections and indexes are ready.");
+    // --- END NEW: Setup for Groups ---
     // --- END NEW ---
     // --- END NEW ---
     console.log("✅ Connected successfully to MongoDB Atlas");
@@ -1597,6 +1616,59 @@ app.post("/channels/set-storage-mode", async (req, res) => {
     }
 });
 
+// --- START: Group Chat API Endpoints (Phase 1) ---
+
+/**
+ * [AUTHENTICATED] Create a new group.
+ * The request only contains unencrypted metadata.
+ * The client is responsible for encrypting and distributing the GroupKey.
+ */
+app.post("/group/create", async (req, res) => {
+    const { groupName, groupAvatar, members, ownerPubKey, signature } = req.body;
+
+    if (!groupName || !Array.isArray(members) || members.length === 0 || !ownerPubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields (groupName, members, ownerPubKey, signature)." });
+    }
+
+    // Verify the signature (owner signed the groupName + all member PubKeys sorted)
+    const membersString = [...members].sort().join(',');
+    const dataToVerify = `${groupName}${membersString}${ownerPubKey}`;
+
+    const isOwner = await verifySignature(ownerPubKey, signature, dataToVerify);
+    if (!isOwner) {
+        return res.status(403).json({ error: "Invalid signature. Cannot create group." });
+    }
+
+    // Ensure the owner is also in the member list
+    if (!members.includes(ownerPubKey)) {
+        members.push(ownerPubKey);
+    }
+
+    try {
+        const newGroup = {
+            groupName: groupName,
+            groupAvatar: groupAvatar || null,
+            owner: ownerPubKey,
+            admins: [ownerPubKey], // Owner is the first admin
+            members: members,     // Full member list
+            createdAt: new Date()
+        };
+
+        const insertResult = await groupsCollection.insertOne(newGroup);
+
+        // Return the full new group object, including its new _id
+        const createdGroup = { ...newGroup, _id: insertResult.insertedId };
+
+        log(`✅ Group Created: ${groupName} (ID: ${createdGroup._id}) by ${ownerPubKey.slice(0,10)}...`);
+        res.status(201).json(createdGroup);
+
+    } catch (err) {
+        console.error("Group creation error:", err);
+        res.status(500).json({ error: "Server error creating group." });
+    }
+});
+
+// --- END: Group Chat API Endpoints (Phase 1) ---
 // --- START: Simple Rate Limiting ---
 
 // --- START: Simple Rate Limiting ---
@@ -1736,22 +1808,122 @@ io.on("connection", (socket) => {
           console.error(`Error fetching offline messages for ${key.slice(0,10)}:`, err);
       }
   });
+
+    // --- NEW: Group Chat Listeners (Phase 1) ---
+
+      socket.on("group_message", async ({ groupID, payload }) => {
+          if (!groupID || !payload) return;
+          const senderPubKey = socket.data.pubKey;
+          if (!senderPubKey) return;
+
+          try {
+              const group = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
+              if (!group) {
+                  return log(`[group_message] Group ${groupID} not found.`);
+              }
+
+              // Verify sender is a member
+              if (!group.members.includes(senderPubKey)) {
+                  return log(`[group_message] Sender ${senderPubKey.slice(0,10)} is not a member of group ${groupID}.`);
+              }
+
+              // Fan-out logic
+              group.members.forEach(memberPubKey => {
+                  if (memberPubKey === senderPubKey) return; // Don't send back to sender
+
+                  const targetSocketId = userSockets[memberPubKey];
+                  if (targetSocketId) {
+                      // --- User is ONLINE ---
+                      io.to(targetSocketId).emit("group_message_in", {
+                          groupID,
+                          payload,
+                          from: senderPubKey
+                      });
+                  } else {
+                      // --- User is OFFLINE ---
+                      // Store in the new offline collection for groups
+                      // We don't await this, let it run in the background
+                      groupOfflineMessagesCollection.insertOne({
+                          recipientPubKey: memberPubKey,
+                          groupID,
+                          from: senderPubKey,
+                          payload,
+                          createdAt: new Date(),
+                          expireAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) // 14-day TTL
+                      }).catch(err => console.error(`Failed to store offline group message: ${err}`));
+                  }
+              });
+
+          } catch (err) {
+              console.error(`Error processing group_message: ${err}`);
+          }
+      });
+
+      socket.on("check-for-group-offline-messages", async () => {
+          const key = socket.data.pubKey;
+          if (!key) return; // Client not registered
+
+          try {
+              const messages = await groupOfflineMessagesCollection.find({ recipientPubKey: key }).toArray();
+              if (messages.length > 0) {
+                  log(`📬 Client ${key.slice(0,10)}... is pulling ${messages.length} GROUP messages.`);
+                  messages.forEach(msg => {
+                      socket.emit("group_message_in", {
+                          id: msg._id.toString(), // Add ID for deletion
+                          groupID: msg.groupID,
+                          from: msg.from,
+                          payload: msg.payload,
+                          sentAt: msg.createdAt
+                      });
+                  });
+              } else {
+                   log(`📬 Client ${key.slice(0,10)}... pulled GROUP messages, 0 found.`);
+              }
+          } catch (err) {
+              console.error(`Error fetching offline GROUP messages for ${key.slice(0,10)}:`, err);
+          }
+      });
+
+      socket.on("group-message-delivered", async (data) => {
+          if (!data || !data.id) return;
+          if (!socket.data.pubKey) return; // Client not registered
+
+          try {
+              const _id = new ObjectId(data.id);
+              // Check that the client confirming is the recipient
+              const deleteResult = await groupOfflineMessagesCollection.deleteOne({
+                  _id: _id,
+                  recipientPubKey: socket.data.pubKey 
+              });
+
+              if (deleteResult.deletedCount === 1) {
+                  log(`✅ Group Message ${data.id} delivered to ${socket.data.pubKey.slice(0,10)}... and deleted.`);
+              } else {
+                  log(`⚠️ Group Message ${data.id} delivery confirmation failed (not found, or wrong recipient).`);
+              }
+          } catch (err) {
+               console.error(`Error deleting delivered group message ${data.id}:`, err);
+          }
+      });
+
+      // --- END: Group Chat Listeners (Phase 1) ---
+  
   // Handle presence subscription
-  socket.on("subscribe-to-presence", (contactPubKeys) => {
-    console.log(`📡 Presence subscription from ${socket.id} for ${contactPubKeys.length} contacts.`);
+    socket.on("subscribe-to-presence", (contactPubKeys) => {
+        console.log(`📡 Presence subscription from ${socket.id} for ${contactPubKeys.length} contacts.`);
   
 
-    // --- 1. Clean up any previous subscriptions for this socket ---
-    const oldSubscriptions = socketSubscriptions[socket.id];
-    if (oldSubscriptions && oldSubscriptions.length) {
-      oldSubscriptions.forEach(pubKey => {
-        if (presenceSubscriptions[pubKey]) {
-          presenceSubscriptions[pubKey] = presenceSubscriptions[pubKey].filter(id => id !== socket.id);
-          if (presenceSubscriptions[pubKey].length === 0) {
-            delete presenceSubscriptions[pubKey];
+        // --- 1. Clean up any previous subscriptions for this socket ---
+      const oldSubscriptions = socketSubscriptions[socket.id];
+      if (oldSubscriptions && oldSubscriptions.length) {
+        oldSubscriptions.forEach(pubKey => {
+          if (presenceSubscriptions[pubKey]) {
+            presenceSubscriptions[pubKey] = presenceSubscriptions[pubKey].filter(id => id !== socket.id);
+            if (presenceSubscriptions[pubKey].length === 0) {
+              delete presenceSubscriptions[pubKey];
+            }
           }
-        }
-      });
+        });
     }
 
     // --- 2. Create the new subscriptions ---
