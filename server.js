@@ -188,9 +188,16 @@ const app = express();
 
 // --- NEW: Explicit CORS Configuration ---
 const corsOptions = {
-  origin: "*", // Allow all origins (you can restrict this later)
-  methods: "GET,POST,DELETE,OPTIONS", // Allow these methods
-  allowedHeaders: "Content-Type" // Allow the JSON content type header
+  origin: "*", // Allow all origins (you can restrict this later)
+  methods: "GET,POST,DELETE,OPTIONS", // Allow these methods
+  // --- THIS IS THE FIX ---
+  // Change from a string to an array and add your custom headers
+  allowedHeaders: [
+    'Content-Type',
+    'X-Syrja-Sig',
+    'X-Syrja-Ts'
+  ]
+  // --- END FIX ---
 };
 
 // Enable pre-flight requests for all routes
