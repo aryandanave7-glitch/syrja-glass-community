@@ -1669,6 +1669,42 @@ app.post("/group/create", async (req, res) => {
 });
 
 // --- END: Group Chat API Endpoints (Phase 1) ---
+/**
+ * [AUTHENTICATED] Get metadata for a specific group.
+ * Client must prove who they are and that they are a member.
+ */
+app.post("/group/meta", async (req, res) => {
+    const { groupID, pubKey, signature } = req.body;
+    if (!groupID || !pubKey || !signature) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    // Verify signature (user signed the groupID to prove request is fresh)
+    const isAuthentic = await verifySignature(pubKey, signature, groupID);
+    if (!isAuthentic) {
+        return res.status(403).json({ error: "Invalid signature." });
+    }
+
+    try {
+        const group = await groupsCollection.findOne({ _id: new ObjectId(groupID) });
+        if (!group) {
+            return res.status(404).json({ error: "Group not found." });
+        }
+
+        // Security check: Ensure the person asking is actually a member
+        if (!group.members.includes(pubKey)) {
+            return res.status(403).json({ error: "You are not a member of this group." });
+        }
+
+        // User is authenticated and is a member, send them the data.
+        log(`[GroupMeta] User ${pubKey.slice(0,10)}... fetched meta for ${group.groupName}`);
+        res.status(200).json(group);
+
+    } catch (err) {
+        console.error("Get /group/meta error:", err);
+        res.status(500).json({ error: "Server error fetching group data." });
+    }
+});
 // --- START: Simple Rate Limiting ---
 
 // --- START: Simple Rate Limiting ---
