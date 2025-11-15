@@ -1745,6 +1745,17 @@ app.post("/group/update-meta", async (req, res) => {
         await groupsCollection.updateOne({ _id: group._id }, { $set: fieldsToUpdate });
 
         log(`[GroupMeta] Admin ${pubKey.slice(0,10)} updated group ${group.groupName}`);
+        // 6. Notify all other members of the metadata change
+        const membersToNotify = group.members.filter(m => m !== pubKey); // Don't notify the admin who made the change
+        membersToNotify.forEach(memberPubKey => {
+            const targetSocketId = userSockets[memberPubKey];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("group_meta_changed", { 
+                    groupID: groupID, 
+                    groupName: group.groupName // Send the (old) name for the toast
+                });
+            }
+        });
         res.status(200).json({ success: true, ...fieldsToUpdate });
 
     } catch (err) {
